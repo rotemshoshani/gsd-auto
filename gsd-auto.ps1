@@ -39,6 +39,7 @@ param(
 $ErrorActionPreference = "Stop"
 $PhasesDir = Join-Path $ProjectDir ".planning\phases"
 $LogDir = Join-Path $ProjectDir ".planning\logs\auto"
+$StopFile = Join-Path $ProjectDir ".planning\STOP"
 
 # Validate project structure
 if (-not (Test-Path $PhasesDir)) {
@@ -100,6 +101,14 @@ function Test-NeedsHuman([string]$Output) {
     return $null
 }
 
+function Test-StopRequested {
+    if (Test-Path $StopFile) {
+        Remove-Item $StopFile -Force
+        return $true
+    }
+    return $false
+}
+
 function Get-PhaseDir([int]$PhaseNum) {
     $dirs = Get-ChildItem $PhasesDir -Directory -Filter "$PhaseNum-*"
     if ($dirs.Count -eq 0) { return $null }
@@ -120,6 +129,22 @@ function Get-RelativePath([string]$FullPath) {
     return $FullPath.Replace("$ProjectDir\", "").Replace("\", "/")
 }
 
+function Test-PlanHasCheckpoint([string]$PlanPath) {
+    # Read frontmatter and check for autonomous: false
+    $inFrontmatter = $false
+    foreach ($line in Get-Content $PlanPath -TotalCount 20) {
+        if ($line -match '^---\s*$') {
+            if ($inFrontmatter) { break }  # End of frontmatter
+            $inFrontmatter = $true
+            continue
+        }
+        if ($inFrontmatter -and $line -match '^\s*autonomous:\s*false') {
+            return $true
+        }
+    }
+    return $false
+}
+
 # -- Main ---------------------------------------------------------------------
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -134,12 +159,22 @@ Write-Host "  Phases:   $StartPhase -> $EndPhase" -ForegroundColor White
 Write-Host "  Model:    opus" -ForegroundColor White
 Write-Host "  Project:  $ProjectDir" -ForegroundColor DarkGray
 if ($DryRun) { Write-Host "  MODE:     DRY RUN" -ForegroundColor Yellow }
+Write-Host "  Stop:     echo stop > .planning\STOP  (from project root)" -ForegroundColor DarkGray
 Write-Host ""
 
 $stopped = $false
 
 for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
     if ($stopped) { break }
+
+    # Check for graceful stop signal
+    if (Test-StopRequested) {
+        Write-Host ""
+        Write-Host "  Stop signal detected (.planning/STOP). Halting before phase $phase." -ForegroundColor Yellow
+        Send-Toast "GSD Auto - Stopped" "Stop signal received before phase $phase"
+        $stopped = $true
+        break
+    }
 
     Write-Host "===========================================================" -ForegroundColor Cyan
     Write-Host "  PHASE $phase" -ForegroundColor Cyan
@@ -207,6 +242,15 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
         if ($stopped) { break }
         $planIndex++
 
+        # Check for graceful stop signal
+        if (Test-StopRequested) {
+            Write-Host ""
+            Write-Host "    Stop signal detected (.planning/STOP). Halting before $($plan.Name)." -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Stopped" "Stop signal received before $($plan.Name)"
+            $stopped = $true
+            break
+        }
+
         # Skip completed plans
         if (Test-PlanComplete $phaseDir.FullName $plan.Name) {
             Write-Host ""
@@ -217,6 +261,22 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
         $totalSteps++
         $timestamp = Get-Date -Format "HH:mm:ss"
         $relativePath = Get-RelativePath $plan.FullName
+
+        # Check if plan has checkpoints (autonomous: false) — must run interactively
+        if (Test-PlanHasCheckpoint $plan.FullName) {
+            Write-Host ""
+            Write-Host "  [$planIndex/$planCount] $timestamp  $($plan.Name) requires human verification" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "    This plan has a checkpoint that needs interactive execution." -ForegroundColor Yellow
+            Write-Host "    Run it in a Claude Code instance:" -ForegroundColor White
+            Write-Host ""
+            Write-Host "    /gsd:execute-plan $relativePath" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "    Then re-run gsd-auto to continue from where it left off." -ForegroundColor White
+            Send-Toast "GSD Auto - Interactive Plan" "$($plan.Name) needs interactive execution"
+            $stopped = $true
+            break
+        }
 
         Write-Host ""
         Write-Host "  [$planIndex/$planCount] $timestamp  Executing $($plan.Name)..." -ForegroundColor Green
