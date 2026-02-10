@@ -157,6 +157,8 @@ Every `claude -p` invocation is logged to `.planning/logs/auto/` inside your pro
   ...
 ```
 
+> **Security note:** Log files contain the full Claude output, which may include snippets of your source code, environment variables, or config values that Claude read during execution. Make sure `.planning/logs/` is in your project's `.gitignore` so logs are never committed. A sample `.gitignore` is included in this repo — copy the relevant lines into your project.
+
 ### Safe to re-run
 
 The script checks for `SUMMARY.md` to determine if a plan is complete. If you re-run the same phase range, completed plans are skipped automatically. This means you can safely restart after a crash, an abort, or a checkpoint pause.

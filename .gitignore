@@ -1,0 +1,12 @@
+# =============================================================================
+# .gitignore for GSD projects using gsd-auto
+#
+# Copy the lines below into your project's .gitignore to prevent
+# accidentally committing logs or sensitive automation artifacts.
+# =============================================================================
+
+# gsd-auto execution logs (may contain source code, env vars, config values)
+.planning/logs/
+
+# Stop signal file (transient)
+.planning/STOP
