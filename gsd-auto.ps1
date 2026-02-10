@@ -110,9 +110,18 @@ function Test-StopRequested {
 }
 
 function Get-PhaseDir([int]$PhaseNum) {
-    $dirs = Get-ChildItem $PhasesDir -Directory -Filter "$PhaseNum-*"
+    $dirs = @(Get-ChildItem $PhasesDir -Directory -Filter "$PhaseNum-*")
     if ($dirs.Count -eq 0) { return $null }
-    return ($dirs | Select-Object -First 1)
+    if ($dirs.Count -eq 1) { return $dirs[0] }
+
+    # Multiple matches — prefer the one that already has PLAN files
+    $withPlans = @($dirs | Where-Object {
+        (Get-ChildItem $_.FullName -Filter "*-PLAN.md" -ErrorAction SilentlyContinue).Count -gt 0
+    })
+    if ($withPlans.Count -gt 0) { return $withPlans[0] }
+
+    # No plans yet in any dir — return the last one (most specific/recent name)
+    return ($dirs | Select-Object -Last 1)
 }
 
 function Get-PlanFiles([string]$PhaseDirPath) {
@@ -224,7 +233,8 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
             if ($response -eq 'stop') { $stopped = $true; break }
         }
 
-        # Re-discover plan files after planning
+        # Re-resolve phase dir (planning may have created a new directory)
+        $phaseDir = Get-PhaseDir $phase
         $planFiles = Get-PlanFiles $phaseDir.FullName
         if (-not $planFiles -or $planFiles.Count -eq 0) {
             Write-Host "    ERROR: No PLAN files found after planning phase $phase" -ForegroundColor Red
