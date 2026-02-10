@@ -1,0 +1,287 @@
+<#
+.SYNOPSIS
+    Automated GSD runner. Plans and executes phases with fresh context per plan.
+
+.DESCRIPTION
+    For each phase in the given range:
+      1. Plans the phase (if not already planned)
+      2. Executes each plan individually via `claude -p` (fresh context = free /clear)
+      3. Skips already-completed plans (SUMMARY.md exists)
+      4. Pauses for human input when checkpoints or verification is needed
+      5. Sends Windows toast notification when paused or done
+
+.EXAMPLE
+    .\gsd-auto.ps1 47 48                              # Phases 47-48 in current dir
+    .\gsd-auto.ps1 46 46                               # Finish phase 46 (skips completed plans)
+    .\gsd-auto.ps1 47 48 -DryRun                       # Preview what would run
+    .\gsd-auto.ps1 47 48 -ProjectDir "C:\my\project"   # Explicit project path
+
+.NOTES
+    Requires: claude CLI in PATH, GSD framework installed
+    Uses --dangerously-skip-permissions for non-interactive execution
+#>
+
+param(
+    [Parameter(Mandatory, Position = 0)]
+    [int]$StartPhase,
+
+    [Parameter(Mandatory, Position = 1)]
+    [int]$EndPhase,
+
+    # Path to the GSD project root (must contain .planning/phases/)
+    # Defaults to the current working directory
+    [string]$ProjectDir = (Get-Location).Path,
+
+    # Preview mode — shows what would run without executing
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = "Stop"
+$PhasesDir = Join-Path $ProjectDir ".planning\phases"
+$LogDir = Join-Path $ProjectDir ".planning\logs\auto"
+
+# Validate project structure
+if (-not (Test-Path $PhasesDir)) {
+    Write-Host "  ERROR: No .planning/phases/ directory found at $ProjectDir" -ForegroundColor Red
+    Write-Host "  Make sure you're in a GSD project root or pass -ProjectDir" -ForegroundColor Yellow
+    exit 1
+}
+
+# Patterns in claude output that mean "stop and get human"
+# These come from GSD's checkpoint and verification systems
+$HumanStopPatterns = @(
+    "CHECKPOINT REACHED",
+    "CHECKPOINT: Verification Required",
+    "CHECKPOINT: Action Required",
+    "CHECKPOINT: Decision Required",
+    "YOUR ACTION:",
+    "human_needed",
+    "gaps_found"
+)
+
+# -- Helpers ------------------------------------------------------------------
+
+function Send-Toast([string]$Title, [string]$Message) {
+    try {
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+        $tmpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
+            [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+        )
+        $tmpl.GetElementsByTagName('text').Item(0).AppendChild($tmpl.CreateTextNode($Title)) > $null
+        $tmpl.GetElementsByTagName('text').Item(1).AppendChild($tmpl.CreateTextNode($Message)) > $null
+        $notif = [Windows.UI.Notifications.ToastNotification]::new($tmpl)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("GSD Auto").Show($notif)
+    } catch { }
+}
+
+function Invoke-Claude([string]$Prompt, [string]$StepLabel) {
+    $logFile = Join-Path $LogDir "$StepLabel-$(Get-Date -Format 'HHmmss').log"
+
+    Push-Location $ProjectDir
+    try {
+        $output = & claude -p $Prompt --dangerously-skip-permissions --model opus 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+
+    $output | Out-File -FilePath $logFile -Encoding utf8
+    Write-Host "    Log: $logFile" -ForegroundColor DarkGray
+
+    return @{ Output = $output; ExitCode = $code; LogFile = $logFile }
+}
+
+function Test-NeedsHuman([string]$Output) {
+    foreach ($pattern in $HumanStopPatterns) {
+        if ($Output -match [regex]::Escape($pattern)) {
+            return $pattern
+        }
+    }
+    return $null
+}
+
+function Get-PhaseDir([int]$PhaseNum) {
+    $dirs = Get-ChildItem $PhasesDir -Directory -Filter "$PhaseNum-*"
+    if ($dirs.Count -eq 0) { return $null }
+    return ($dirs | Select-Object -First 1)
+}
+
+function Get-PlanFiles([string]$PhaseDirPath) {
+    return Get-ChildItem $PhaseDirPath -Filter "*-PLAN.md" -ErrorAction SilentlyContinue |
+        Sort-Object Name
+}
+
+function Test-PlanComplete([string]$PhaseDirPath, [string]$PlanFileName) {
+    $summaryName = $PlanFileName -replace '-PLAN\.md$', '-SUMMARY.md'
+    return Test-Path (Join-Path $PhaseDirPath $summaryName)
+}
+
+function Get-RelativePath([string]$FullPath) {
+    return $FullPath.Replace("$ProjectDir\", "").Replace("\", "/")
+}
+
+# -- Main ---------------------------------------------------------------------
+
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+$totalSteps = 0
+$startTime = Get-Date
+
+Write-Host ""
+Write-Host "  GSD Auto-Runner" -ForegroundColor Cyan
+Write-Host "  ===============" -ForegroundColor Cyan
+Write-Host "  Phases:   $StartPhase -> $EndPhase" -ForegroundColor White
+Write-Host "  Model:    opus" -ForegroundColor White
+Write-Host "  Project:  $ProjectDir" -ForegroundColor DarkGray
+if ($DryRun) { Write-Host "  MODE:     DRY RUN" -ForegroundColor Yellow }
+Write-Host ""
+
+$stopped = $false
+
+for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
+    if ($stopped) { break }
+
+    Write-Host "===========================================================" -ForegroundColor Cyan
+    Write-Host "  PHASE $phase" -ForegroundColor Cyan
+    Write-Host "===========================================================" -ForegroundColor Cyan
+
+    # -- Find phase directory --------------------------------------------------
+    $phaseDir = Get-PhaseDir $phase
+    if (-not $phaseDir) {
+        Write-Host "  ERROR: No directory found for phase $phase in $PhasesDir" -ForegroundColor Red
+        $stopped = $true
+        break
+    }
+    Write-Host "  Dir: $($phaseDir.Name)" -ForegroundColor DarkGray
+
+    # -- Plan phase if needed --------------------------------------------------
+    $planFiles = Get-PlanFiles $phaseDir.FullName
+    if (-not $planFiles -or $planFiles.Count -eq 0) {
+        $totalSteps++
+        $timestamp = Get-Date -Format "HH:mm:ss"
+        Write-Host ""
+        Write-Host "  [$totalSteps] $timestamp  Planning phase $phase..." -ForegroundColor Green
+        Write-Host "    /gsd:plan-phase $phase" -ForegroundColor Cyan
+
+        if ($DryRun) {
+            Write-Host "    [DRY RUN] Would run: claude -p '/gsd:plan-phase $phase'" -ForegroundColor Yellow
+            continue
+        }
+
+        $result = Invoke-Claude "/gsd:plan-phase $phase" "phase$phase-plan"
+
+        if ($result.ExitCode -and $result.ExitCode -ne 0) {
+            Write-Host "    ERROR: plan-phase exited with code $($result.ExitCode)" -ForegroundColor Red
+            Send-Toast "GSD Auto - Error" "plan-phase $phase failed"
+            $stopped = $true
+            break
+        }
+
+        # Check if planning itself needs human input
+        $humanMatch = Test-NeedsHuman $result.Output
+        if ($humanMatch) {
+            Write-Host ""
+            Write-Host "    HUMAN INPUT NEEDED (matched: $humanMatch)" -ForegroundColor Red
+            Write-Host "    Check log for details: $($result.LogFile)" -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Paused" "Phase $phase planning needs human input"
+            Write-Host ""
+            $response = Read-Host "    Press Enter to continue, or type 'stop' to abort"
+            if ($response -eq 'stop') { $stopped = $true; break }
+        }
+
+        # Re-discover plan files after planning
+        $planFiles = Get-PlanFiles $phaseDir.FullName
+        if (-not $planFiles -or $planFiles.Count -eq 0) {
+            Write-Host "    ERROR: No PLAN files found after planning phase $phase" -ForegroundColor Red
+            $stopped = $true
+            break
+        }
+    }
+
+    $planCount = @($planFiles).Count
+    Write-Host "  Plans: $planCount" -ForegroundColor White
+
+    # -- Execute each plan -----------------------------------------------------
+    $planIndex = 0
+    foreach ($plan in $planFiles) {
+        if ($stopped) { break }
+        $planIndex++
+
+        # Skip completed plans
+        if (Test-PlanComplete $phaseDir.FullName $plan.Name) {
+            Write-Host ""
+            Write-Host "  [$planIndex/$planCount] SKIP $($plan.Name) (already complete)" -ForegroundColor DarkGray
+            continue
+        }
+
+        $totalSteps++
+        $timestamp = Get-Date -Format "HH:mm:ss"
+        $relativePath = Get-RelativePath $plan.FullName
+
+        Write-Host ""
+        Write-Host "  [$planIndex/$planCount] $timestamp  Executing $($plan.Name)..." -ForegroundColor Green
+        Write-Host "    /gsd:execute-plan $relativePath" -ForegroundColor Cyan
+
+        if ($DryRun) {
+            Write-Host "    [DRY RUN] Would run: claude -p '/gsd:execute-plan $relativePath'" -ForegroundColor Yellow
+            continue
+        }
+
+        $result = Invoke-Claude "/gsd:execute-plan $relativePath" "phase$phase-$($plan.BaseName)"
+
+        if ($result.ExitCode -and $result.ExitCode -ne 0) {
+            Write-Host "    ERROR: execute-plan exited with code $($result.ExitCode)" -ForegroundColor Red
+            Write-Host "    Check log: $($result.LogFile)" -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Error" "$($plan.Name) failed"
+            $stopped = $true
+            break
+        }
+
+        # Check for human verification/checkpoints in output
+        $humanMatch = Test-NeedsHuman $result.Output
+        if ($humanMatch) {
+            Write-Host ""
+            Write-Host "    HUMAN INPUT NEEDED (matched: $humanMatch)" -ForegroundColor Red
+            Write-Host "    Check log for details: $($result.LogFile)" -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Paused" "$($plan.Name) needs human input"
+            Write-Host ""
+            $response = Read-Host "    Press Enter to continue, or type 'stop' to abort"
+            if ($response -eq 'stop') { $stopped = $true; break }
+        }
+
+        # Verify the plan actually completed (SUMMARY.md should exist now)
+        if (-not (Test-PlanComplete $phaseDir.FullName $plan.Name)) {
+            Write-Host "    WARNING: No SUMMARY.md found after execution" -ForegroundColor Yellow
+            Write-Host "    The plan may not have completed successfully" -ForegroundColor Yellow
+            Write-Host "    Check log: $($result.LogFile)" -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Warning" "$($plan.Name) may not have completed"
+            Write-Host ""
+            $response = Read-Host "    Press Enter to continue anyway, or type 'stop' to abort"
+            if ($response -eq 'stop') { $stopped = $true; break }
+        } else {
+            Write-Host "    Done. SUMMARY.md created." -ForegroundColor Green
+        }
+    }
+
+    if (-not $stopped) {
+        Write-Host ""
+        Write-Host "  Phase $phase complete!" -ForegroundColor Green
+    }
+}
+
+# -- Summary -------------------------------------------------------------------
+
+$elapsed = (Get-Date) - $startTime
+
+Write-Host ""
+Write-Host "===========================================================" -ForegroundColor Cyan
+if ($stopped) {
+    Write-Host "  Stopped after $totalSteps steps ($($elapsed.ToString('hh\:mm\:ss')))" -ForegroundColor Yellow
+} else {
+    Write-Host "  All done! $totalSteps steps in $($elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+}
+Write-Host "  Logs: $LogDir" -ForegroundColor DarkGray
+Write-Host "===========================================================" -ForegroundColor Cyan
+Write-Host ""
+
+Send-Toast "GSD Auto - Finished" "$totalSteps steps in $($elapsed.ToString('hh\:mm\:ss'))"
