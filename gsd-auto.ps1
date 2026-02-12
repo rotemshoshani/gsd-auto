@@ -110,7 +110,7 @@ function Test-StopRequested {
 }
 
 function Get-PhaseDir([int]$PhaseNum) {
-    $dirs = @(Get-ChildItem $PhasesDir -Directory -Filter "$PhaseNum-*")
+    $dirs = @(Get-ChildItem $PhasesDir -Directory | Where-Object { $_.Name -match "^0*$PhaseNum-" })
     if ($dirs.Count -eq 0) { return $null }
     if ($dirs.Count -eq 1) { return $dirs[0] }
 
