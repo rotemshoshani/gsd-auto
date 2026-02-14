@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Automated GSD runner. Plans and executes phases with fresh context per plan.
 
@@ -62,8 +62,7 @@ $HumanStopPatterns = @(
 
 # Patterns that indicate API rate limiting — must stop immediately
 $RateLimitPatterns = @(
-    "You've hit your limit",
-    "you.ve hit your limit",
+    "You.ve hit your limit",
     "rate limit",
     "Too many requests",
     "429"
@@ -260,7 +259,7 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
             }
         }
         if (-not $hasAnySummary) {
-            Write-Host "  Plans exist but none executed — re-planning for fresh context" -ForegroundColor Yellow
+            Write-Host "  Plans exist but none executed - re-planning for fresh context" -ForegroundColor Yellow
             foreach ($pf in $planFiles) { Remove-Item $pf.FullName -Force }
             $planFiles = $null
             $needsPlanning = $true
@@ -283,7 +282,7 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
 
         # Check for rate limits first — must stop immediately
         if (Test-RateLimit $result.Output) {
-            Write-Host "    RATE LIMITED — planning phase $phase hit API limit" -ForegroundColor Red
+            Write-Host "    RATE LIMITED - planning phase $phase hit API limit" -ForegroundColor Red
             Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
             Send-Toast "GSD Auto - Rate Limited" "API limit hit during planning phase $phase"
             $stopped = $true
@@ -377,7 +376,7 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
 
         # Check for rate limits first — must stop immediately
         if (Test-RateLimit $result.Output) {
-            Write-Host "    RATE LIMITED — execution hit API limit" -ForegroundColor Red
+            Write-Host "    RATE LIMITED - execution hit API limit" -ForegroundColor Red
             Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
             Write-Host "    Will resume from $($plan.Name)." -ForegroundColor Yellow
             Send-Toast "GSD Auto - Rate Limited" "API limit hit during $($plan.Name)"
