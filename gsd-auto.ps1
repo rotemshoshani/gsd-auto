@@ -60,6 +60,15 @@ $HumanStopPatterns = @(
     "gaps_found"
 )
 
+# Patterns that indicate API rate limiting — must stop immediately
+$RateLimitPatterns = @(
+    "You've hit your limit",
+    "you.ve hit your limit",
+    "rate limit",
+    "Too many requests",
+    "429"
+)
+
 # -- Sleep prevention ---------------------------------------------------------
 
 Add-Type -TypeDefinition @"
@@ -121,6 +130,15 @@ function Test-NeedsHuman([string]$Output) {
         }
     }
     return $null
+}
+
+function Test-RateLimit([string]$Output) {
+    foreach ($pattern in $RateLimitPatterns) {
+        if ($Output -match [regex]::Escape($pattern)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Test-StopRequested {
@@ -229,7 +247,27 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
 
     # -- Plan phase if needed --------------------------------------------------
     $planFiles = Get-PlanFiles $phaseDir.FullName
-    if (-not $planFiles -or $planFiles.Count -eq 0) {
+    $needsPlanning = (-not $planFiles -or $planFiles.Count -eq 0)
+
+    # If plans exist but NONE have been executed (no summaries), the previous run
+    # planned but never got to execute (e.g. rate limited). Re-plan for fresh context.
+    if (-not $needsPlanning -and $planFiles) {
+        $hasAnySummary = $false
+        foreach ($pf in $planFiles) {
+            if (Test-PlanComplete $phaseDir.FullName $pf.Name) {
+                $hasAnySummary = $true
+                break
+            }
+        }
+        if (-not $hasAnySummary) {
+            Write-Host "  Plans exist but none executed — re-planning for fresh context" -ForegroundColor Yellow
+            foreach ($pf in $planFiles) { Remove-Item $pf.FullName -Force }
+            $planFiles = $null
+            $needsPlanning = $true
+        }
+    }
+
+    if ($needsPlanning) {
         $totalSteps++
         $timestamp = Get-Date -Format "HH:mm:ss"
         Write-Host ""
@@ -242,6 +280,15 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
         }
 
         $result = Invoke-Claude "/gsd:plan-phase $phase" "phase$phase-plan"
+
+        # Check for rate limits first — must stop immediately
+        if (Test-RateLimit $result.Output) {
+            Write-Host "    RATE LIMITED — planning phase $phase hit API limit" -ForegroundColor Red
+            Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Rate Limited" "API limit hit during planning phase $phase"
+            $stopped = $true
+            break
+        }
 
         if ($result.ExitCode -and $result.ExitCode -ne 0) {
             Write-Host "    ERROR: plan-phase exited with code $($result.ExitCode)" -ForegroundColor Red
@@ -327,6 +374,16 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
         }
 
         $result = Invoke-Claude "/gsd:execute-plan $relativePath" "phase$phase-$($plan.BaseName)"
+
+        # Check for rate limits first — must stop immediately
+        if (Test-RateLimit $result.Output) {
+            Write-Host "    RATE LIMITED — execution hit API limit" -ForegroundColor Red
+            Write-Host "    Wait for rate limit to reset, then re-run." -ForegroundColor Yellow
+            Write-Host "    Will resume from $($plan.Name)." -ForegroundColor Yellow
+            Send-Toast "GSD Auto - Rate Limited" "API limit hit during $($plan.Name)"
+            $stopped = $true
+            break
+        }
 
         if ($result.ExitCode -and $result.ExitCode -ne 0) {
             Write-Host "    ERROR: execute-plan exited with code $($result.ExitCode)" -ForegroundColor Red
