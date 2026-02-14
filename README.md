@@ -54,22 +54,10 @@ The script runs `claude -p` with `--dangerously-skip-permissions` for non-intera
 
 ### 5. GSD config for automation
 
-Set your `.planning/config.json` to prevent GSD from asking confirmations that can't be answered non-interactively:
+Set your `.planning/config.json` to skip GSD's workflow confirmations (which can't be answered in non-interactive `claude -p` sessions):
 
 ```json
-{
-  "mode": "yolo",
-  "gates": {
-    "confirm_project": false,
-    "confirm_phases": false,
-    "confirm_roadmap": false,
-    "confirm_breakdown": false,
-    "confirm_plan": false,
-    "execute_next_plan": false,
-    "issues_review": false,
-    "confirm_transition": false
-  }
-}
+{ "mode": "yolo" }
 ```
 
 ---
