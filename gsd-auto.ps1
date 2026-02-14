@@ -60,6 +60,28 @@ $HumanStopPatterns = @(
     "gaps_found"
 )
 
+# -- Sleep prevention ---------------------------------------------------------
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SleepPrevention {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SetThreadExecutionState(uint esFlags);
+
+    private const uint ES_CONTINUOUS       = 0x80000000;
+    private const uint ES_SYSTEM_REQUIRED  = 0x00000001;
+
+    public static void PreventSleep() {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    }
+
+    public static void AllowSleep() {
+        SetThreadExecutionState(ES_CONTINUOUS);
+    }
+}
+"@
+
 # -- Helpers ------------------------------------------------------------------
 
 function Send-Toast([string]$Title, [string]$Message) {
@@ -172,6 +194,13 @@ Write-Host "  Stop:     echo stop > .planning\STOP  (from project root)" -Foregr
 Write-Host ""
 
 $stopped = $false
+
+# Keep system awake for the entire run
+[SleepPrevention]::PreventSleep()
+Write-Host "  Sleep prevention: ON" -ForegroundColor DarkGray
+Write-Host ""
+
+try {
 
 for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
     if ($stopped) { break }
@@ -340,6 +369,12 @@ for ($phase = $StartPhase; $phase -le $EndPhase; $phase++) {
 }
 
 # -- Summary -------------------------------------------------------------------
+
+} finally {
+    [SleepPrevention]::AllowSleep()
+    Write-Host ""
+    Write-Host "  Sleep prevention: OFF" -ForegroundColor DarkGray
+}
 
 $elapsed = (Get-Date) - $startTime
 
