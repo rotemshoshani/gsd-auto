@@ -15,6 +15,7 @@
     .\gsd-auto.ps1 46 46                               # Finish phase 46 (skips completed plans)
     .\gsd-auto.ps1 47 48 -DryRun                       # Preview what would run
     .\gsd-auto.ps1 47 48 -ProjectDir "C:\my\project"   # Explicit project path
+    .\gsd-auto.ps1 47 48 -Push                            # Auto commit + push when done
 
 .NOTES
     Requires: claude CLI in PATH, GSD framework installed
@@ -33,7 +34,10 @@ param(
     [string]$ProjectDir = (Get-Location).Path,
 
     # Preview mode — shows what would run without executing
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # Auto commit and push all changes when the run finishes
+    [switch]$Push
 )
 
 $ErrorActionPreference = "Stop"
@@ -207,6 +211,7 @@ Write-Host "  Phases:   $StartPhase -> $EndPhase" -ForegroundColor White
 Write-Host "  Model:    opus" -ForegroundColor White
 Write-Host "  Project:  $ProjectDir" -ForegroundColor DarkGray
 if ($DryRun) { Write-Host "  MODE:     DRY RUN" -ForegroundColor Yellow }
+if ($Push) { Write-Host "  Push:     ON (will commit + push when done)" -ForegroundColor White }
 Write-Host "  Stop:     echo stop > .planning\STOP  (from project root)" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -446,3 +451,32 @@ Write-Host "===========================================================" -Foregr
 Write-Host ""
 
 Send-Toast "GSD Auto - Finished" "$totalSteps steps in $($elapsed.ToString('hh\:mm\:ss'))"
+
+# -- Auto commit + push --------------------------------------------------------
+
+if ($Push -and -not $DryRun -and $totalSteps -gt 0) {
+    Push-Location $ProjectDir
+    try {
+        # Check if there are any changes to commit
+        $status = & git status --porcelain 2>&1
+        if ($status) {
+            $msg = "GSD Auto: phases $StartPhase-$EndPhase ($totalSteps steps)"
+            Write-Host ""
+            Write-Host "  Committing and pushing..." -ForegroundColor Cyan
+            & git add -A
+            & git commit -m $msg
+            & git push
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  Pushed successfully." -ForegroundColor Green
+            } else {
+                Write-Host "  Push failed (exit code $LASTEXITCODE)" -ForegroundColor Red
+                Send-Toast "GSD Auto - Push Failed" "git push failed"
+            }
+        } else {
+            Write-Host ""
+            Write-Host "  No changes to commit." -ForegroundColor DarkGray
+        }
+    } finally {
+        Pop-Location
+    }
+}

@@ -7,6 +7,7 @@ Hands-free runner for the [GSD framework](https://www.npmjs.com/package/get-shit
 .\gsd-auto.ps1 12 12                  # Finish phase 12 (skips completed plans)
 .\gsd-auto.ps1 5 8 -DryRun            # Preview what would run
 .\gsd-auto.ps1 5 8 -ProjectDir "C:\"  # Explicit project path
+.\gsd-auto.ps1 5 8 -Push              # Auto commit + push when done
 ```
 
 ---
@@ -161,6 +162,7 @@ The script checks for `SUMMARY.md` to determine if a plan is complete. If you re
 | `EndPhase` | Yes | Last phase number to process (inclusive) |
 | `-ProjectDir` | No | Path to GSD project root. Defaults to current directory |
 | `-DryRun` | No | Preview what would run without executing anything |
+| `-Push` | No | Auto commit and push all changes when the run finishes |
 
 ---
 
@@ -222,6 +224,24 @@ echo stop > .planning\STOP
 The script checks for this file before each plan. When found, it deletes the file and halts cleanly. Since the path is relative to the project, you can run gsd-auto on multiple projects simultaneously and stop them independently.
 
 The stop hint is also shown in the startup banner as a reminder.
+
+---
+
+## Auto commit + push
+
+Add `-Push` to automatically commit and push all changes when the run finishes:
+
+```powershell
+.\gsd-auto.ps1 5 8 -Push
+```
+
+When the run ends (whether all phases complete or it stops early), the script will:
+1. Check if there are any uncommitted changes in the project
+2. Stage everything with `git add -A`
+3. Commit with a message like `GSD Auto: phases 5-8 (12 steps)`
+4. Push to the remote
+
+The commit/push is skipped if there are no changes, if it was a dry run, or if zero steps were executed.
 
 ---
 
