@@ -120,6 +120,7 @@ function Invoke-Claude([string]$Prompt, [string]$StepLabel) {
         Pop-Location
     }
 
+    if (-not (Test-Path (Split-Path $logFile))) { New-Item -ItemType Directory -Path (Split-Path $logFile) -Force | Out-Null }
     $output | Out-File -FilePath $logFile -Encoding utf8
     Write-Host "    Log: $logFile" -ForegroundColor DarkGray
 
