@@ -16,6 +16,10 @@ set -euo pipefail
 
 TOP_CMD="${DEV_ENV_TOP:-npx convex dev}"
 BOT_CMD="${DEV_ENV_BOTTOM:-npm run dev}"
+PULL_WATCH=0
+PULL_REMOTE="origin"
+PULL_BRANCH="dev"
+PULL_INTERVAL=30
 
 canonical_dir() {
   (cd "$1" && pwd -P)
@@ -106,6 +110,53 @@ cleanup_tmux_session() {
   fi
 }
 
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+pull_once() {
+  local project_dir="$1"
+  local remote="$2"
+  local branch="$3"
+  local current_branch local_ref remote_ref
+
+  (
+    cd "$project_dir"
+
+    printf '\n[%s] dev-env: fetching %s/%s\n' "$(timestamp)" "$remote" "$branch"
+    git fetch "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch"
+    git status --short --branch
+
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+    if [[ "$current_branch" != "$branch" ]]; then
+      printf 'dev-env: current branch is %s; skipping automatic pull for %s\n' "${current_branch:-detached}" "$branch"
+      return 0
+    fi
+
+    local_ref="$(git rev-parse --verify "$branch" 2>/dev/null || true)"
+    remote_ref="$(git rev-parse --verify "$remote/$branch" 2>/dev/null || true)"
+    if [[ -z "$local_ref" || -z "$remote_ref" || "$local_ref" == "$remote_ref" ]]; then
+      return 0
+    fi
+
+    printf 'dev-env: %s/%s changed; fast-forwarding %s\n' "$remote" "$branch" "$branch"
+    git pull --ff-only "$remote" "$branch"
+    git status --short --branch
+  )
+}
+
+pull_watcher() {
+  local project_dir="$1"
+  local remote="$2"
+  local branch="$3"
+  local interval="$4"
+
+  while true; do
+    pull_once "$project_dir" "$remote" "$branch" || true
+    sleep "$interval"
+  done
+}
+
 # ---- Runner subcommand (wraps each worker pane) ------------------------------
 # Keeps the pane alive after the command exits/crashes, so the user can read
 # the final output and restart it via the controller. Avoids the race where
@@ -133,9 +184,23 @@ if [[ "${1:-}" == "__cleanup_tmux_session" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "__pull_once" ]]; then
+  shift
+  [[ $# -eq 3 ]] || { echo "__pull_once needs PROJECT_DIR REMOTE BRANCH" >&2; exit 1; }
+  pull_once "$1" "$2" "$3"
+  exit 0
+fi
+
+if [[ "${1:-}" == "__pull_watcher" ]]; then
+  shift
+  [[ $# -eq 4 ]] || { echo "__pull_watcher needs PROJECT_DIR REMOTE BRANCH INTERVAL" >&2; exit 1; }
+  pull_watcher "$1" "$2" "$3" "$4"
+  exit 0
+fi
+
 usage() {
   cat <<EOF
-Usage: dev-env [--override CMD1 CMD2]
+Usage: dev-env [--pull] [--override CMD1 CMD2]
 
 Spawns a tmux session for the current directory:
   - row 0 (top):    controller bar — single-keypress menu
@@ -146,6 +211,7 @@ Controller keys (focus the controller pane, then press):
   T = restart TOP    B = restart BOTTOM    A = restart BOTH    Q = kill all
 
 Options:
+  --pull                 Watch origin/dev every 30s and fast-forward dev.
   --override CMD1 CMD2   Override the top/bottom commands.
   -h, --help             Show this help.
 
@@ -216,6 +282,10 @@ fi
 # ---- Arg parsing -------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --pull)
+      PULL_WATCH=1
+      shift
+      ;;
     --override)
       [[ $# -ge 3 ]] || { echo "--override needs 2 args: CMD1 CMD2" >&2; exit 1; }
       TOP_CMD="$2"
@@ -228,6 +298,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v tmux >/dev/null 2>&1 || { echo "dev-env: tmux not installed" >&2; exit 1; }
+if [[ "$PULL_WATCH" == "1" ]]; then
+  command -v git >/dev/null 2>&1 || { echo "dev-env: git not installed" >&2; exit 1; }
+fi
 
 PROJ_DIR="$(pwd)"
 SELF="$(readlink -f "$0")"
@@ -278,6 +351,11 @@ TOP_ID=$(tmux split-window -t "$CTRL_ID" -v -l "$TOP_SIZE" -c "$PROJ_DIR" \
 BOT_ID=$(tmux split-window -t "$TOP_ID" -v -c "$PROJ_DIR" \
            -P -F '#{pane_id}' "$BOT_RUN")
 
+if [[ "$PULL_WATCH" == "1" ]]; then
+  PULL_CMD=$(printf '%q __pull_watcher %q %q %q %q' "$SELF" "$PROJ_DIR" "$PULL_REMOTE" "$PULL_BRANCH" "$PULL_INTERVAL")
+  tmux new-window -d -t "$SESSION" -n pull -c "$PROJ_DIR" "$PULL_CMD"
+fi
+
 # Stash IDs + cmds in session env so the controller can read them
 tmux set-environment -t "$SESSION" DEV_TOP_ID  "$TOP_ID"
 tmux set-environment -t "$SESSION" DEV_BOT_ID  "$BOT_ID"
@@ -285,6 +363,7 @@ tmux set-environment -t "$SESSION" DEV_TOP_CMD "$TOP_CMD"
 tmux set-environment -t "$SESSION" DEV_BOT_CMD "$BOT_CMD"
 
 # Focus the controller pane so single-keypress menu is live on attach
+tmux select-window -t "$SESSION:dev"
 tmux select-pane -t "$CTRL_ID"
 
 # Attach (or switch, if already inside tmux)

@@ -65,6 +65,17 @@ Override the commands:
 dev-env --override "pnpm api:dev" "pnpm web:dev"
 ```
 
+Keep the local `dev` branch current with `origin/dev` while the session runs:
+
+```bash
+dev-env --pull
+```
+
+With `--pull`, `dev-env` opens a separate tmux window named `pull`. Every
+30 seconds it fetches `origin/dev`, prints `git status --short --branch`, and
+fast-forwards the local `dev` branch when `origin/dev` changes. It does not
+restart the dev panes.
+
 Or via environment variables:
 
 ```bash
