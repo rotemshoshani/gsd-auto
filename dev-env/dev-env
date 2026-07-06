@@ -123,7 +123,8 @@ pull_once() {
   (
     cd "$project_dir"
 
-    printf '\n[%s] dev-env: fetching %s/%s\n' "$(timestamp)" "$remote" "$branch"
+    printf '\n[%s] dev-env: checking gh in...\n' "$(timestamp)"
+    printf '[%s] dev-env: fetching %s/%s\n' "$(timestamp)" "$remote" "$branch"
     git fetch "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch"
     git status --short --branch
 
@@ -139,8 +140,10 @@ pull_once() {
       return 0
     fi
 
+    printf 'dev-env: diff found - pulling...\n'
     printf 'dev-env: %s/%s changed; fast-forwarding %s\n' "$remote" "$branch" "$branch"
     git pull --ff-only "$remote" "$branch"
+    printf 'dev-env: pull finished\n'
     git status --short --branch
   )
 }
@@ -347,14 +350,15 @@ TOP_SIZE=$(( WIN_H > 4 ? WIN_H - 2 : WIN_H / 2 ))
 TOP_ID=$(tmux split-window -t "$CTRL_ID" -v -l "$TOP_SIZE" -c "$PROJ_DIR" \
            -P -F '#{pane_id}' "$TOP_RUN")
 
+if [[ "$PULL_WATCH" == "1" ]]; then
+  PULL_CMD=$(printf '%q __pull_watcher %q %q %q %q' "$SELF" "$PROJ_DIR" "$PULL_REMOTE" "$PULL_BRANCH" "$PULL_INTERVAL")
+  tmux split-window -t "$TOP_ID" -v -b -l 1 -c "$PROJ_DIR" \
+    -P -F '#{pane_id}' "$PULL_CMD" >/dev/null
+fi
+
 # Split TOP evenly into TOP/BOTTOM (no -l → tmux splits 50/50)
 BOT_ID=$(tmux split-window -t "$TOP_ID" -v -c "$PROJ_DIR" \
            -P -F '#{pane_id}' "$BOT_RUN")
-
-if [[ "$PULL_WATCH" == "1" ]]; then
-  PULL_CMD=$(printf '%q __pull_watcher %q %q %q %q' "$SELF" "$PROJ_DIR" "$PULL_REMOTE" "$PULL_BRANCH" "$PULL_INTERVAL")
-  tmux new-window -d -t "$SESSION" -n pull -c "$PROJ_DIR" "$PULL_CMD"
-fi
 
 # Stash IDs + cmds in session env so the controller can read them
 tmux set-environment -t "$SESSION" DEV_TOP_ID  "$TOP_ID"

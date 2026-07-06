@@ -44,3 +44,21 @@ if ! grep -q 'dev-env: origin/dev changed; fast-forwarding dev' "$out_file"; the
   cat "$out_file" >&2
   exit 1
 fi
+
+if ! grep -q 'dev-env: checking gh in...' "$out_file"; then
+  echo "expected __pull_once to report that it is checking gh" >&2
+  cat "$out_file" >&2
+  exit 1
+fi
+
+if ! grep -q 'dev-env: diff found - pulling...' "$out_file"; then
+  echo "expected __pull_once to report that it found a diff" >&2
+  cat "$out_file" >&2
+  exit 1
+fi
+
+if ! grep -q 'dev-env: pull finished' "$out_file"; then
+  echo "expected __pull_once to report that pull finished" >&2
+  cat "$out_file" >&2
+  exit 1
+fi
