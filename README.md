@@ -16,6 +16,9 @@ Bash watcher that auto-approves OpenAI Codex CLI permission prompts inside a tmu
 ### [council](council/)
 A tmux launcher for brainstorming with two AI CLIs side-by-side — Claude Code on the left, Codex on the right — with a controller bar that relays one model's last reply to the other on a single keypress.
 
+### [codex-delay](codex-delay/)
+Terminal UI for scheduling one prompt into a fresh or existing Codex session after a countdown. It discovers resumable sessions for the current repository and launches through the local `cdx` alias.
+
 ### [dev-env](dev-env/)
 Tiny tmux launcher for projects with two long-running dev processes (default: `npx convex dev` and `npm run dev`). Single-keypress controller for restarting either pane or tearing the session down.
 
@@ -33,3 +36,6 @@ Tmux controller for feeding Codex a queue of prompts one at a time. Each prompt 
 
 ### [statusline](statusline/)
 Custom Claude Code statusline (Node script) showing model, current task or GSD phase state, working directory, and context usage. `install.sh` wires it into Claude Code's settings.
+
+### [slp](slp/)
+Repository copy of the `slp` countdown command, accepting seconds, `MM:SS`, or `HH:MM:SS`.

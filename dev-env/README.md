@@ -20,7 +20,8 @@ Spawns a tmux session in the current directory laid out like this:
 The controller is a single-keypress menu for restarting either pane or
 tearing the whole session down. Worker panes stay visible after their
 command exits (success or crash), so you can read the final output and
-restart from the controller.
+restart from the controller. By default, the controller also restarts both
+worker panes every three hours.
 
 ## Prerequisites
 
@@ -71,10 +72,21 @@ Keep the local `dev` branch current with `origin/dev` while the session runs:
 dev-env --pull
 ```
 
-With `--pull`, `dev-env` opens a separate tmux window named `pull`. Every
-30 seconds it fetches `origin/dev`, prints `git status --short --branch`, and
-fast-forwards the local `dev` branch when `origin/dev` changes. It does not
-restart the dev panes.
+With `--pull`, `dev-env` adds a one-row pull pane to the main `dev` window.
+Every 30 seconds it fetches `origin/dev`, prints `git status --short --branch`,
+and fast-forwards the local `dev` branch when `origin/dev` changes. It does
+not restart the dev panes.
+
+Change the automatic restart interval (in hours), or disable it:
+
+```bash
+dev-env --restart 6
+dev-env --no-restart
+```
+
+`--restart` accepts positive whole or decimal hour values. A manual `A`
+restart starts a fresh interval; restarting just one pane leaves the shared
+timer unchanged.
 
 Or via environment variables:
 

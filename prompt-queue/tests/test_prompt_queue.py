@@ -10,6 +10,7 @@ from prompt_queue import (
     Controller,
     RunItem,
     apply_agent_override,
+    archive_queue_directory,
     build_prompt_argument_command,
     build_prompt_list_watch_command,
     build_resume_prompt_command,
@@ -26,6 +27,7 @@ from prompt_queue import (
     load_config,
     make_runtime_dir,
     paste_settle_seconds,
+    queue_config_path,
     read_resumable_completed_indices,
     read_prompt_queue,
     render_prompt_list,
@@ -118,8 +120,36 @@ class PromptQueueTests(unittest.TestCase):
                 self.assertEqual(default_config_path(), default_path)
                 local_path.write_text("{}")
                 self.assertEqual(default_config_path(), local_path)
-                args = prompt_queue.build_parser().parse_args(["run", "--no-attach"])
+                args = prompt_queue.build_parser().parse_args(["run", "sample-queue", "--no-attach"])
                 self.assertEqual(args.config, str(local_path))
+
+    def test_run_parser_accepts_no_confirm_aliases_after_run(self) -> None:
+        parser = prompt_queue.build_parser()
+
+        self.assertTrue(parser.parse_args(["run", "sample-queue", "--no-confirm"]).no_confirm)
+        self.assertTrue(parser.parse_args(["run", "sample-queue", "--yes"]).no_confirm)
+        self.assertTrue(parser.parse_args(["run", "sample-queue", "-y"]).no_confirm)
+
+    def test_public_commands_require_queue_id(self) -> None:
+        parser = prompt_queue.build_parser()
+
+        for command in ("run", "attach", "stop-next", "finish-sleep", "kill", "status", "collect-prompts"):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                parser.parse_args([command])
+
+    def test_queue_config_path_uses_validated_queue_folder(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir) / "queues"
+            folder = root / "release-42"
+            folder.mkdir(parents=True)
+            config_path = folder / "config.json"
+            config_path.write_text("{}")
+            with mock.patch.object(prompt_queue, "QUEUES_DIR", root):
+                self.assertEqual(queue_config_path("release-42"), config_path)
+                with self.assertRaisesRegex(SystemExit, "may contain only"):
+                    queue_config_path("../escape")
 
     def test_prompts_string_that_points_to_file_raises_clear_error(self) -> None:
         from tempfile import TemporaryDirectory
@@ -388,6 +418,44 @@ class PromptQueueTests(unittest.TestCase):
             config = load_config(config_path)
 
             self.assertEqual(config.completion_notify_session_id, "")
+
+    def test_load_config_reads_relative_completion_prompt_file(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            completion_prompt = tmp_path / "finish.md"
+            completion_prompt.write_text("Finish the authorized PR workflow.\n")
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "completion_prompt_file": "finish.md",
+                        "prompts": ["one"],
+                    }
+                )
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.completion_prompt, "Finish the authorized PR workflow.")
+
+    def test_load_config_rejects_missing_completion_prompt_file(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "completion_prompt_file": "missing.md",
+                        "prompts": ["one"],
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(ValueError, "completion_prompt_file does not exist"):
+                load_config(config_path)
 
     def test_render_status_shows_sectioned_dashboard(self) -> None:
         queue = [
@@ -687,6 +755,71 @@ class PromptQueueTests(unittest.TestCase):
         self.assertFalse(killed)
         self.assertEqual(calls, [("has-session", "-t", "prompt-queue-project")])
 
+    def test_sync_tmux_session_environment_refreshes_user_bus_for_new_panes(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_tmux(*args: str, **kwargs: object) -> CompletedProcess[str]:
+            calls.append(args)
+            return CompletedProcess(["tmux", *args], 0, "", "")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "XDG_RUNTIME_DIR": "/run/user/1234",
+                    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1234/bus",
+                },
+                clear=True,
+            ),
+            mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+        ):
+            prompt_queue.sync_tmux_session_environment()
+
+        self.assertEqual(calls, [
+            ("set-environment", "-g", "XDG_RUNTIME_DIR", "/run/user/1234"),
+            ("set-environment", "-g", "DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1234/bus"),
+        ])
+
+    def test_controller_process_is_running_detects_stale_pid(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            runtime_dir = Path(raw_dir)
+            (runtime_dir / "controller.json").write_text(
+                json.dumps({"pid": 424242, "session": "prompt-queue-project"})
+            )
+            with mock.patch.object(prompt_queue.os, "kill", side_effect=ProcessLookupError):
+                running = prompt_queue.controller_process_is_running(
+                    runtime_dir,
+                    "prompt-queue-project",
+                )
+
+        self.assertFalse(running)
+
+    def test_prepare_tmux_session_replacement_renames_current_session(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_tmux(*args: str, **kwargs: object) -> CompletedProcess[str]:
+            calls.append(args)
+            return CompletedProcess(["tmux", *args], 0, "", "")
+
+        with (
+            mock.patch.object(prompt_queue, "current_tmux_session", return_value="prompt-queue-project"),
+            mock.patch.object(prompt_queue.os, "getpid", return_value=4321),
+            mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+        ):
+            stale_session = prompt_queue.prepare_tmux_session_replacement("prompt-queue-project")
+
+        self.assertEqual(stale_session, "prompt-queue-project-stale-4321")
+        self.assertEqual(calls, [
+            (
+                "rename-session",
+                "-t",
+                "prompt-queue-project",
+                "prompt-queue-project-stale-4321",
+            )
+        ])
+
     def test_ready_marker_blocks_on_exact_marker_line_only(self) -> None:
         from tempfile import TemporaryDirectory
 
@@ -981,6 +1114,37 @@ class PromptQueueTests(unittest.TestCase):
 
             self.assertEqual(result, "ready")
 
+    def test_completion_prompt_file_replaces_generic_finisher_instructions(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "project"
+            project_dir.mkdir()
+            (tmp_path / "finish.md").write_text(
+                "Review the complete diff, then commit, push, and open the authorized PR.\n"
+            )
+            config_path = tmp_path / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": str(project_dir),
+                        "completion_prompt_file": "finish.md",
+                        "prompts": ["one"],
+                    }
+                )
+            )
+            config = load_config(config_path, runtime_dir_override=tmp_path / "runtime")
+            controller = Controller(config, "session", "%worker", "%planner")
+            controller.completion_prompt_dir.mkdir(parents=True)
+
+            prompt_path = controller.write_completion_prompt_file()
+            prompt_text = prompt_path.read_text()
+
+            self.assertIn("Target repo:", prompt_text)
+            self.assertIn("commit, push, and open the authorized PR", prompt_text)
+            self.assertNotIn("Do not commit unless explicitly requested.", prompt_text)
+
     def test_default_work_base_dir_lives_under_project_planning_work(self) -> None:
         self.assertEqual(
             default_work_base_dir(Path("/repo")),
@@ -992,6 +1156,34 @@ class PromptQueueTests(unittest.TestCase):
             make_runtime_dir(Path("/repo"), "20260526-175900"),
             Path("/repo/.planning/work/prompt-queue/20260526-175900"),
         )
+
+    def test_tagged_runtime_dirs_are_isolated_by_queue_id(self) -> None:
+        self.assertEqual(
+            make_runtime_dir(Path("/repo"), "20260526-175900", "frontend-release"),
+            Path("/repo/.planning/work/prompt-queue/frontend-release/20260526-175900"),
+        )
+
+    def test_archive_queue_directory_moves_the_whole_self_contained_folder(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            source = tmp_path / "queues" / "frontend-release"
+            (source / "prompts").mkdir(parents=True)
+            (source / "config.json").write_text("{}")
+            (source / ".env.local").write_text("PROMPT_QUEUE_WORKDIR=/repo\n")
+            (source / "prompts" / "001-work.md").write_text("work")
+
+            destination = archive_queue_directory(
+                source,
+                "frontend-release",
+                "20260712-120000",
+                tmp_path / "archive",
+            )
+
+            self.assertEqual(destination, tmp_path / "archive" / "20260712-120000-frontend-release")
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / "prompts" / "001-work.md").read_text(), "work")
 
     def test_latest_runtime_dir_finds_newest_timestamped_run(self) -> None:
         from tempfile import TemporaryDirectory
@@ -1179,6 +1371,45 @@ class PromptQueueTests(unittest.TestCase):
             self.assertEqual(result, "complete")
             self.assertEqual(controller.stop_calls, 1)
 
+    def test_controller_archives_tagged_queue_only_after_successful_completion(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        class CompletingController(Controller):
+            def run_one(self, item: RunItem, recovery_attempts: int = 0) -> str:
+                self.completed.add(item.index)
+                return "complete"
+
+            def render(self) -> None:
+                return
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            source = tmp_path / "queues" / "release"
+            source.mkdir(parents=True)
+            config_path = source / "config.json"
+            config_path.write_text(json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]}))
+            runtime_dir = tmp_path / "runtime"
+            config = load_config(config_path, runtime_dir_override=runtime_dir)
+            controller = CompletingController(
+                config,
+                "session",
+                "%worker",
+                queue_id="release",
+                queue_dir_path=source,
+                archive_root=tmp_path / "archive",
+                archive_stamp="20260712-120000",
+            )
+
+            controller.run()
+
+            destination = tmp_path / "archive" / "20260712-120000-release"
+            self.assertTrue((destination / "config.json").exists())
+            self.assertFalse(source.exists())
+            archived = json.loads((runtime_dir / "archived.json").read_text())
+            self.assertEqual(archived["destination"], str(destination))
+
     def test_start_session_attaches_when_existing_session_choice_is_attach(self) -> None:
         from argparse import Namespace
         from tempfile import TemporaryDirectory
@@ -1202,6 +1433,166 @@ class PromptQueueTests(unittest.TestCase):
 
             attach_session.assert_called_once_with("prompt-queue-repo")
             kill_session.assert_not_called()
+
+    def test_start_session_no_confirm_skips_interactive_new_run_prompt(self) -> None:
+        from argparse import Namespace
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]}))
+            args = Namespace(config=str(config_path), cld=False, session="", no_attach=True, no_confirm=True)
+            pane_ids = iter(["%controller", "%prompt-list", "%worker"])
+
+            def fake_tmux(*tmux_args: str, **kwargs: object) -> CompletedProcess[str]:
+                if tmux_args[0] in {"new-session", "split-window"}:
+                    return CompletedProcess(["tmux", *tmux_args], 0, next(pane_ids), "")
+                return CompletedProcess(["tmux", *tmux_args], 0, "", "")
+
+            with (
+                mock.patch.object(prompt_queue.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(prompt_queue, "tmux_session_exists", return_value=False),
+                mock.patch.object(prompt_queue.sys.stdin, "isatty", return_value=True),
+                mock.patch.object(prompt_queue, "prompt_start_new_run") as prompt_start_new_run,
+                mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+            ):
+                prompt_queue.start_session(args)
+
+            prompt_start_new_run.assert_not_called()
+
+    def test_start_session_replaces_stale_controller_without_prompting(self) -> None:
+        from argparse import Namespace
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]}))
+            args = Namespace(config=str(config_path), cld=False, session="", no_attach=True)
+            pane_ids = iter(["%controller", "%prompt-list", "%worker"])
+
+            def fake_tmux(*tmux_args: str, **kwargs: object) -> CompletedProcess[str]:
+                if tmux_args[0] in {"new-session", "split-window"}:
+                    return CompletedProcess(["tmux", *tmux_args], 0, next(pane_ids), "")
+                return CompletedProcess(["tmux", *tmux_args], 0, "", "")
+
+            with (
+                mock.patch.object(prompt_queue.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(prompt_queue, "tmux_session_exists", return_value=True),
+                mock.patch.object(prompt_queue, "controller_process_is_running", return_value=False),
+                mock.patch.object(prompt_queue, "prompt_existing_session_action") as choose_action,
+                mock.patch.object(prompt_queue, "prepare_tmux_session_replacement", return_value="") as replace_session,
+                mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+                mock.patch("builtins.print"),
+            ):
+                prompt_queue.start_session(args)
+
+            choose_action.assert_not_called()
+            replace_session.assert_called_once_with("prompt-queue-repo")
+
+    def test_start_session_replaces_stale_session_from_inside_its_worker_pane(self) -> None:
+        from argparse import Namespace
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            config_path = tmp_path / "config.json"
+            config_path.write_text(json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]}))
+            args = Namespace(config=str(config_path), cld=False, session="", no_attach=False)
+            calls: list[tuple[str, ...]] = []
+            pane_ids = iter(["%controller", "%prompt-list", "%worker"])
+
+            def fake_tmux(*tmux_args: str, **kwargs: object) -> CompletedProcess[str]:
+                calls.append(tmux_args)
+                if tmux_args[0] in {"new-session", "split-window"}:
+                    return CompletedProcess(["tmux", *tmux_args], 0, next(pane_ids), "")
+                return CompletedProcess(["tmux", *tmux_args], 0, "", "")
+
+            with (
+                mock.patch.object(prompt_queue.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(prompt_queue, "tmux_session_exists", return_value=True),
+                mock.patch.object(prompt_queue, "controller_process_is_running", return_value=False),
+                mock.patch.object(
+                    prompt_queue,
+                    "prepare_tmux_session_replacement",
+                    return_value="prompt-queue-repo-stale-4321",
+                ),
+                mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+                mock.patch.object(prompt_queue, "attach_session") as attach_session,
+                mock.patch("builtins.print"),
+            ):
+                prompt_queue.start_session(args)
+
+            self.assertIn(("switch-client", "-t", "prompt-queue-repo"), calls)
+            controller_send = next(
+                call for call in calls if call[:3] == ("send-keys", "-t", "%controller")
+            )
+            self.assertTrue(
+                controller_send[3].startswith(
+                    "tmux kill-session -t 'prompt-queue-repo-stale-4321'; python3 "
+                )
+            )
+            attach_session.assert_not_called()
+
+    def test_start_session_uses_tagged_config_runtime_and_tmux_session(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as raw_dir:
+            tmp_path = Path(raw_dir)
+            project_dir = tmp_path / "repo"
+            project_dir.mkdir()
+            queues_root = tmp_path / "queues"
+            queue_folder = queues_root / "blue-release"
+            queue_folder.mkdir(parents=True)
+            (queue_folder / "config.json").write_text(
+                json.dumps({"project_dir": str(project_dir), "prompts": ["prompt"]})
+            )
+            args = prompt_queue.build_parser().parse_args(["run", "blue-release", "--no-attach"])
+            calls: list[tuple[str, ...]] = []
+            pane_ids = iter(["%controller", "%prompt-list", "%worker"])
+
+            def fake_tmux(*tmux_args: str, **kwargs: object) -> CompletedProcess[str]:
+                calls.append(tmux_args)
+                if tmux_args[0] in {"new-session", "split-window"}:
+                    return CompletedProcess(["tmux", *tmux_args], 0, next(pane_ids), "")
+                return CompletedProcess(["tmux", *tmux_args], 0, "", "")
+
+            with (
+                mock.patch.object(prompt_queue, "QUEUES_DIR", queues_root),
+                mock.patch.object(prompt_queue, "ARCHIVE_DIR", tmp_path / "archive"),
+                mock.patch.object(prompt_queue.shutil, "which", return_value="/usr/bin/tmux"),
+                mock.patch.object(prompt_queue, "tmux_session_exists", return_value=False),
+                mock.patch.object(prompt_queue.sys.stdin, "isatty", return_value=False),
+                mock.patch.object(prompt_queue, "tmux", side_effect=fake_tmux),
+                mock.patch("builtins.print"),
+            ):
+                prompt_queue.start_session(args)
+
+            new_session = next(call for call in calls if call[0] == "new-session")
+            self.assertEqual(new_session[new_session.index("-s") + 1], "prompt-queue-blue-release-repo")
+            new_session_index = calls.index(new_session)
+            worker_split = next(
+                call for call in calls if call[0] == "split-window" and "%prompt-list" in call
+            )
+            worker_split_index = calls.index(worker_split)
+            environment_calls = [
+                index for index, call in enumerate(calls) if call[0] == "set-environment"
+            ]
+            self.assertTrue(environment_calls)
+            self.assertTrue(all(new_session_index < index < worker_split_index for index in environment_calls))
+            controller_send = next(
+                call for call in calls if call[:3] == ("send-keys", "-t", "%controller")
+            )
+            self.assertIn("--queue-id 'blue-release'", controller_send[3])
+            self.assertIn(str(project_dir / ".planning/work/prompt-queue/blue-release"), controller_send[3])
+            self.assertIn(f"--queue-dir '{queue_folder}'", controller_send[3])
 
     def test_start_session_layout_places_controller_over_planner_and_prompt_list_over_worker(self) -> None:
         from argparse import Namespace

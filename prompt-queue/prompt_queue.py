@@ -20,6 +20,8 @@ from pathlib import Path
 DEFAULT_CONFIG = Path(__file__).with_name("config.json")
 LOCAL_CONFIG = Path(__file__).with_name("config.local.json")
 DEFAULT_ENV = Path(__file__).with_name(".env.local")
+QUEUES_DIR = Path(__file__).with_name("queues")
+ARCHIVE_DIR = Path(__file__).with_name("archive")
 STOP_NEXT_FLAG = "stop-next.flag"
 FINISH_SLEEP_FLAG = "finish-sleep.flag"
 PROGRESS_FILE = "progress.json"
@@ -36,10 +38,39 @@ DEFAULT_CODEX_COMMAND = "cdx"
 DEFAULT_CLAUDE_COMMAND = "cld"
 DEFAULT_CODEX_PROMPT_DELIVERY = "argument_file"
 DEFAULT_CLAUDE_PROMPT_DELIVERY = "paste"
+TMUX_SESSION_ENV_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 
 def default_config_path() -> Path:
     return LOCAL_CONFIG if LOCAL_CONFIG.exists() else DEFAULT_CONFIG
+
+
+def validate_queue_id(value: str) -> str:
+    queue_id = value.strip()
+    if not queue_id:
+        raise SystemExit("prompt-queue: queue id is required")
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if queue_id in {".", ".."} or any(character not in allowed for character in queue_id):
+        raise SystemExit("prompt-queue: queue id may contain only letters, numbers, hyphens, and underscores")
+    return queue_id
+
+
+def queue_dir(queue_id: str) -> Path:
+    return QUEUES_DIR / validate_queue_id(queue_id)
+
+
+def queue_config_path(queue_id: str) -> Path:
+    path = queue_dir(queue_id) / "config.json"
+    if not path.is_file():
+        raise SystemExit(f"prompt-queue: queue {queue_id!r} not found at {path}")
+    return path
+
+
+def config_path_for_args(args: argparse.Namespace) -> Path:
+    queue_id = getattr(args, "queue_id", "")
+    if queue_id:
+        return queue_config_path(queue_id)
+    return Path(args.config).expanduser().resolve()
 
 
 @dataclass(frozen=True)
@@ -77,6 +108,7 @@ class Config:
     completion_notify_command: str
     completion_notify_session_id: str
     completion_notify_check_lines: int
+    completion_prompt: str
     prompts: tuple[PromptItem, ...]
 
 
@@ -99,6 +131,7 @@ class RunPlan:
     pending: list[int]
     resume_runtime_dir: Path | None
     existing_session: bool
+    queue_id: str = ""
 
 
 def expand_project_path(value: str, base_dir: Path) -> Path:
@@ -174,6 +207,13 @@ def load_config(
     completion_notify_session_id = expand_config_string(
         str(raw.get("completion_notify_session_id", raw.get("blocked_recovery_session_id", "")))
     )
+    completion_prompt_file = str(raw.get("completion_prompt_file", "")).strip()
+    completion_prompt = ""
+    if completion_prompt_file:
+        completion_prompt_path = expand_path(completion_prompt_file, base_dir)
+        if not completion_prompt_path.is_file():
+            raise ValueError(f"completion_prompt_file does not exist: {completion_prompt_path}")
+        completion_prompt = completion_prompt_path.read_text().strip()
 
     return Config(
         project_dir=project_dir,
@@ -201,6 +241,7 @@ def load_config(
         completion_notify_command=str(raw.get("completion_notify_command", raw.get("blocked_recovery_command", DEFAULT_CODEX_COMMAND))),
         completion_notify_session_id=completion_notify_session_id,
         completion_notify_check_lines=int(raw.get("completion_notify_check_lines", 20)),
+        completion_prompt=completion_prompt,
         prompts=prompts,
     )
 
@@ -403,22 +444,39 @@ def build_run_queue(config: Config) -> list[RunItem]:
     ]
 
 
-def default_work_base_dir(project_dir: Path) -> Path:
-    return project_dir / ".planning" / "work" / "prompt-queue"
+def default_work_base_dir(project_dir: Path, queue_id: str = "") -> Path:
+    base_dir = project_dir / ".planning" / "work" / "prompt-queue"
+    return base_dir / validate_queue_id(queue_id) if queue_id else base_dir
 
 
-def make_runtime_dir(project_dir: Path, timestamp: str | None = None) -> Path:
+def make_runtime_dir(project_dir: Path, timestamp: str | None = None, queue_id: str = "") -> Path:
     stamp = timestamp or datetime.now().strftime(TIMESTAMP_FORMAT)
-    return default_work_base_dir(project_dir) / stamp
+    return default_work_base_dir(project_dir, queue_id) / stamp
 
 
-def latest_runtime_dir(project_dir: Path) -> Path:
-    base_dir = default_work_base_dir(project_dir)
+def latest_runtime_dir(project_dir: Path, queue_id: str = "") -> Path:
+    base_dir = default_work_base_dir(project_dir, queue_id)
     candidates = sorted(path for path in base_dir.iterdir() if path.is_dir()) if base_dir.exists() else []
     candidates = [path for path in candidates if (path / "session.json").exists() or (path / "state.json").exists()]
     if not candidates:
         raise SystemExit(f"no prompt-queue runs found under {base_dir}")
     return candidates[-1]
+
+
+def archive_queue_directory(source_dir: Path, queue_id: str, stamp: str, archive_root: Path = ARCHIVE_DIR) -> Path:
+    source_dir = source_dir.expanduser().resolve()
+    if not source_dir.is_dir():
+        raise SystemExit(f"prompt-queue: active queue directory is missing: {source_dir}")
+
+    archive_root = archive_root.expanduser().resolve()
+    archive_root.mkdir(parents=True, exist_ok=True)
+    base_name = f"{stamp}-{validate_queue_id(queue_id)}"
+    destination = archive_root / base_name
+    suffix = 2
+    while destination.exists():
+        destination = archive_root / f"{base_name}-{suffix}"
+        suffix += 1
+    return Path(shutil.move(str(source_dir), str(destination)))
 
 
 def format_index_ranges(indices: list[int] | set[int] | tuple[int, ...]) -> str:
@@ -445,6 +503,7 @@ def build_run_plan(
     resume_runtime_dir: Path | None,
     existing_session: bool,
     completed: set[int] | None = None,
+    queue_id: str = "",
 ) -> RunPlan:
     completed_indices = sorted(completed if completed is not None else set())
     pending = [item.index for item in config.prompts if item.index not in completed_indices]
@@ -456,6 +515,7 @@ def build_run_plan(
         pending=pending,
         resume_runtime_dir=resume_runtime_dir,
         existing_session=existing_session,
+        queue_id=queue_id,
     )
 
 
@@ -463,6 +523,7 @@ def render_run_preflight(plan: RunPlan) -> str:
     lines = [
         "prompt-queue preflight",
         "",
+        *([f"queue id: {plan.queue_id}"] if plan.queue_id else []),
         f"target repo: {plan.project_dir}",
         f"queue: {plan.prompt_count} prompts",
         f"resume source: {plan.resume_runtime_dir if plan.resume_runtime_dir else 'none'}",
@@ -742,10 +803,78 @@ def tmux_target_exists(target: str) -> bool:
     return tmux("display-message", "-p", "-t", target, "#{pane_id}", check=False, capture=True).returncode == 0
 
 
+def tmux_session_environment() -> dict[str, str]:
+    values = {
+        key: value
+        for key in TMUX_SESSION_ENV_KEYS
+        if (value := os.environ.get(key, "").strip())
+    }
+    runtime_dir = values.get("XDG_RUNTIME_DIR", "")
+    if not runtime_dir:
+        fallback_runtime_dir = Path(f"/run/user/{os.getuid()}")
+        if fallback_runtime_dir.is_dir():
+            runtime_dir = str(fallback_runtime_dir)
+            values["XDG_RUNTIME_DIR"] = runtime_dir
+    if "DBUS_SESSION_BUS_ADDRESS" not in values and runtime_dir:
+        bus_path = Path(runtime_dir) / "bus"
+        if bus_path.exists():
+            values["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+    return values
+
+
+def sync_tmux_session_environment() -> None:
+    for key, value in tmux_session_environment().items():
+        tmux("set-environment", "-g", key, value)
+
+
+def current_tmux_session() -> str | None:
+    if not os.environ.get("TMUX"):
+        return None
+    result = tmux("display-message", "-p", "#S", check=False, capture=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def kill_tmux_session_if_exists(session: str) -> bool:
     if tmux("has-session", "-t", session, check=False, capture=True).returncode != 0:
         return False
     tmux("kill-session", "-t", session, check=False)
+    return True
+
+
+def prepare_tmux_session_replacement(session: str) -> str:
+    if current_tmux_session() != session:
+        kill_tmux_session_if_exists(session)
+        return ""
+    stale_session = f"{session}-stale-{os.getpid()}"
+    tmux("rename-session", "-t", session, stale_session)
+    return stale_session
+
+
+def controller_process_is_running(runtime_dir: Path | None, expected_session: str) -> bool | None:
+    if runtime_dir is None:
+        return None
+    controller_path = runtime_dir / "controller.json"
+    if not controller_path.is_file():
+        return None
+    try:
+        controller = read_json(controller_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if controller.get("session") != expected_session:
+        return None
+    pid = controller.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
     return True
 
 
@@ -805,11 +934,25 @@ def write_collected_prompts(
 
 
 class Controller:
-    def __init__(self, config: Config, session: str, worker_pane: str, planner_pane: str = "") -> None:
+    def __init__(
+        self,
+        config: Config,
+        session: str,
+        worker_pane: str,
+        planner_pane: str = "",
+        queue_id: str = "",
+        queue_dir_path: Path | None = None,
+        archive_root: Path | None = None,
+        archive_stamp: str = "",
+    ) -> None:
         self.config = config
         self.session = session
         self.worker_pane = worker_pane
         self.planner_pane = planner_pane
+        self.queue_id = queue_id
+        self.queue_dir_path = queue_dir_path
+        self.archive_root = archive_root
+        self.archive_stamp = archive_stamp
         self.queue = build_run_queue(config)
         self.completed: set[int] = read_resumable_completed_indices(config.runtime_dir, config.prompts)
         self.current_index: int | None = None
@@ -858,7 +1001,6 @@ class Controller:
         write_progress_snapshot(self.config.runtime_dir, self.completed)
         self.render()
 
-        ran_prompt = False
         for item in self.queue:
             if item.index in self.completed:
                 continue
@@ -869,7 +1011,6 @@ class Controller:
                     self.current_index = None
                     self.render()
                     return
-                ran_prompt = True
                 result = self.run_one(item, recovery_attempts)
                 if result == "complete":
                     break
@@ -893,10 +1034,32 @@ class Controller:
                 return
 
         self.current_index = None
-        if self.config.completion_notify and ran_prompt:
+        if self.config.completion_notify:
             self.notify_completion()
         self.phase = "complete"
         self.remaining_seconds = None
+        self.render()
+        self.archive_queue()
+
+    def archive_queue(self) -> None:
+        if not self.queue_id or self.queue_dir_path is None or self.archive_root is None:
+            return
+        destination = archive_queue_directory(
+            self.queue_dir_path,
+            self.queue_id,
+            self.archive_stamp or datetime.now().strftime(TIMESTAMP_FORMAT),
+            self.archive_root,
+        )
+        write_json(
+            self.config.runtime_dir / "archived.json",
+            {
+                "queue_id": self.queue_id,
+                "source": str(self.queue_dir_path),
+                "destination": str(destination),
+                "archived_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        self.phase = f"complete; archived to {destination.name}"
         self.render()
 
     def run_one(self, item: RunItem, recovery_attempts: int = 0) -> str:
@@ -1314,6 +1477,17 @@ class Controller:
 
     def write_completion_prompt_file(self) -> Path:
         prompt_file = self.completion_prompt_dir / "verify-completed-run.txt"
+        default_instructions = [
+            "Verify the original plan is complete against the current worktree.",
+            "Inspect the executor captures and run focused verification commands.",
+            "If you find implementation errors or missing work, make the needed changes and verify them.",
+            "Do not commit unless explicitly requested.",
+        ]
+        completion_instructions = (
+            ["Follow these workflow-specific completion instructions:", "", self.config.completion_prompt]
+            if self.config.completion_prompt
+            else default_instructions
+        )
         prompt_file.write_text(
             "\n".join(
                 [
@@ -1326,10 +1500,7 @@ class Controller:
                     f"Executor captures: {self.capture_dir}",
                     f"Executor prompts: {self.prompt_dir}",
                     "",
-                    "Verify the original plan is complete against the current worktree.",
-                    "Inspect the executor captures and run focused verification commands.",
-                    "If you find implementation errors or missing work, make the needed changes and verify them.",
-                    "Do not commit unless explicitly requested.",
+                    *completion_instructions,
                     "",
                     "When finished, provide a concise verification summary and let Codex return to Ready.",
                 ]
@@ -1540,10 +1711,20 @@ def run_controller(args: argparse.Namespace) -> None:
     old_attrs = termios.tcgetattr(sys.stdin)
     try:
         tty.setcbreak(sys.stdin.fileno())
-        Controller(config, args.session, args.worker_pane, args.planner_pane).run()
+        controller = Controller(
+            config,
+            args.session,
+            args.worker_pane,
+            args.planner_pane,
+            queue_id=args.queue_id,
+            queue_dir_path=Path(args.queue_dir).resolve() if args.queue_dir else None,
+            archive_root=Path(args.archive_root).resolve() if args.archive_root else None,
+            archive_stamp=args.archive_stamp,
+        )
+        controller.run()
         while True:
             select.select([sys.stdin], [], [], 1)
-            Controller(config, args.session, args.worker_pane, args.planner_pane).handle_keyboard()
+            controller.handle_keyboard()
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
 
@@ -1552,7 +1733,8 @@ def start_session(args: argparse.Namespace) -> None:
     if shutil.which("tmux") is None:
         raise SystemExit("prompt-queue: tmux is required")
 
-    config_path = Path(args.config).expanduser().resolve()
+    queue_id = validate_queue_id(args.queue_id) if getattr(args, "queue_id", "") else ""
+    config_path = config_path_for_args(args)
     initial_config = apply_agent_override(load_config(config_path), args.cld)
     if not initial_config.prompts:
         raise SystemExit(f"prompt-queue: configure prompts or prompt_files in {config_path.name}")
@@ -1564,7 +1746,7 @@ def start_session(args: argparse.Namespace) -> None:
     start_stamp = datetime.now().strftime(TIMESTAMP_FORMAT)
     config = replace(
         initial_config,
-        runtime_dir=make_runtime_dir(initial_config.project_dir, start_stamp),
+        runtime_dir=make_runtime_dir(initial_config.project_dir, start_stamp, queue_id),
     )
     if not config.project_dir.is_dir():
         raise SystemExit(f"project_dir does not exist: {config.project_dir}")
@@ -1572,23 +1754,35 @@ def start_session(args: argparse.Namespace) -> None:
     resume_completed: set[int] = set()
     resume_runtime_dir: Path | None = None
     try:
-        resume_runtime_dir = latest_runtime_dir(config.project_dir)
+        resume_runtime_dir = latest_runtime_dir(config.project_dir, queue_id)
         resume_completed = read_resumable_completed_indices(resume_runtime_dir, config.prompts)
     except SystemExit:
         resume_completed = set()
 
-    session = args.session or f"{config.session_name}-{sanitize_name(config.project_dir.name)}"
+    session_parts = [config.session_name]
+    if queue_id:
+        session_parts.append(sanitize_name(queue_id))
+    session_parts.append(sanitize_name(config.project_dir.name))
+    session = args.session or "-".join(session_parts)
     existing_session = tmux_session_exists(session)
-    plan = build_run_plan(config, session, resume_runtime_dir, existing_session, resume_completed)
+    plan = build_run_plan(config, session, resume_runtime_dir, existing_session, resume_completed, queue_id)
+    no_confirm = bool(getattr(args, "no_confirm", False))
     if existing_session:
-        action = prompt_existing_session_action(plan) if sys.stdin.isatty() else "attach"
+        controller_running = controller_process_is_running(resume_runtime_dir, session)
+        if controller_running is False:
+            print(render_run_preflight(plan))
+            print("")
+            print("Stale tmux session found; replacing its stopped controller automatically.")
+            action = "replace"
+        else:
+            action = prompt_existing_session_action(plan) if sys.stdin.isatty() else "attach"
         if action == "attach":
             attach_session(session)
             return
         if action == "quit":
             return
     else:
-        if sys.stdin.isatty() and not prompt_start_new_run(plan):
+        if sys.stdin.isatty() and not no_confirm and not prompt_start_new_run(plan):
             return
         if not sys.stdin.isatty():
             print(render_run_preflight(plan))
@@ -1601,8 +1795,7 @@ def start_session(args: argparse.Namespace) -> None:
     write_prompt_queue(queue_file, config.prompts)
     write_progress_snapshot(config.runtime_dir, resume_completed)
 
-    if existing_session:
-        kill_tmux_session_if_exists(session)
+    stale_session_to_kill = prepare_tmux_session_replacement(session) if existing_session else ""
 
     term_w = str(shutil.get_terminal_size((200, 50)).columns)
     term_h = str(shutil.get_terminal_size((200, 50)).lines)
@@ -1629,6 +1822,7 @@ def start_session(args: argparse.Namespace) -> None:
         "bash",
         capture=True,
     ).stdout.strip()
+    sync_tmux_session_environment()
     prompt_list_id = tmux(
         "split-window",
         "-t",
@@ -1681,7 +1875,8 @@ def start_session(args: argparse.Namespace) -> None:
     tmux("set-option", "-t", session, "mouse", "on")
     tmux("set-option", "-t", session, "status", "on")
     tmux("set-option", "-t", session, "status-position", "top")
-    tmux("set-option", "-t", session, "status-left", f"#[fg=cyan,bold] prompt-queue {config.project_dir.name} ")
+    queue_label = f"{queue_id} · " if queue_id else ""
+    tmux("set-option", "-t", session, "status-left", f"#[fg=cyan,bold] prompt-queue {queue_label}{config.project_dir.name} ")
     tmux("set-option", "-t", session, "status-right", "")
 
     controller_cmd = (
@@ -1692,15 +1887,20 @@ def start_session(args: argparse.Namespace) -> None:
         f"--worker-pane {sh_quote(worker_id)} "
         f"--planner-pane {sh_quote(planner_id)} "
         f"--runtime-dir {sh_quote(str(config.runtime_dir))} "
-        f"--queue-file {sh_quote(str(queue_file))}"
+        f"--queue-file {sh_quote(str(queue_file))} "
+        f"--queue-id {sh_quote(queue_id)} "
+        f"--queue-dir {sh_quote(str(config_path.parent) if queue_id else '')} "
+        f"--archive-root {sh_quote(str(ARCHIVE_DIR) if queue_id else '')} "
+        f"--archive-stamp {sh_quote(start_stamp)}"
     )
-    tmux("send-keys", "-t", controller_id, controller_cmd, "Enter")
     tmux("select-pane", "-t", controller_id)
 
     write_json(
         config.runtime_dir / "session.json",
         {
             "session": session,
+            "queue_id": queue_id,
+            "queue_config": str(config_path),
             "worker_pane": worker_id,
             "prompt_list_pane": prompt_list_id,
             "planner_pane": planner_id,
@@ -1717,6 +1917,16 @@ def start_session(args: argparse.Namespace) -> None:
             "completion_notify_session_id": config.completion_notify_session_id,
         },
     )
+    if stale_session_to_kill and not args.no_attach:
+        tmux("switch-client", "-t", session)
+    if stale_session_to_kill:
+        controller_cmd = (
+            f"tmux kill-session -t {sh_quote(stale_session_to_kill)}; "
+            f"{controller_cmd}"
+        )
+    tmux("send-keys", "-t", controller_id, controller_cmd, "Enter")
+    if stale_session_to_kill:
+        return
     if not args.no_attach:
         attach_session(session)
 
@@ -1739,12 +1949,16 @@ def read_session(runtime_dir: Path) -> str:
 
 
 def load_config_for_control(args: argparse.Namespace) -> Config:
-    return load_config(Path(args.config))
+    return load_config(config_path_for_args(args))
+
+
+def latest_runtime_dir_for_args(args: argparse.Namespace, config: Config) -> Path:
+    return latest_runtime_dir(config.project_dir, getattr(args, "queue_id", ""))
 
 
 def stop_next(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
-    runtime_dir = latest_runtime_dir(config.project_dir)
+    runtime_dir = latest_runtime_dir_for_args(args, config)
     armed = toggle_stop_after_current(runtime_dir)
     state = "armed" if armed else "disarmed"
     print(f"{state} stop-after-current: {runtime_dir / STOP_NEXT_FLAG}")
@@ -1752,14 +1966,14 @@ def stop_next(args: argparse.Namespace) -> None:
 
 def finish_sleep(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
-    runtime_dir = latest_runtime_dir(config.project_dir)
+    runtime_dir = latest_runtime_dir_for_args(args, config)
     (runtime_dir / FINISH_SLEEP_FLAG).write_text("1\n")
     print(f"armed finish-current-wait: {runtime_dir / FINISH_SLEEP_FLAG}")
 
 
 def kill(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
-    runtime_dir = latest_runtime_dir(config.project_dir)
+    runtime_dir = latest_runtime_dir_for_args(args, config)
     session = args.session or read_session(runtime_dir)
     tmux("kill-session", "-t", session, check=False)
     print(f"killed tmux session: {session}")
@@ -1767,7 +1981,7 @@ def kill(args: argparse.Namespace) -> None:
 
 def status(args: argparse.Namespace) -> None:
     config = load_config_for_control(args)
-    runtime_dir = latest_runtime_dir(config.project_dir)
+    runtime_dir = latest_runtime_dir_for_args(args, config)
     state_file = runtime_dir / "state.json"
     if not state_file.exists():
         raise SystemExit(f"no state file at {state_file}")
@@ -1775,7 +1989,7 @@ def status(args: argparse.Namespace) -> None:
 
 
 def collect_prompts(args: argparse.Namespace) -> None:
-    config_path = Path(args.config).expanduser().resolve()
+    config_path = config_path_for_args(args)
     collected: list[tuple[str, str]] = []
 
     print(f"Writing prompts into {config_path.parent / 'prompts'}")
@@ -1829,9 +2043,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="start or attach to the tmux prompt queue session")
+    run = sub.add_parser("run", help="start or attach to a tagged tmux prompt queue session")
+    run.add_argument("queue_id", help="queue folder name under queues/")
     run.add_argument("--session", default="", help="override tmux session name")
     run.add_argument("--no-attach", action="store_true", help="create session without attaching")
+    run.add_argument(
+        "-y",
+        "--yes",
+        "--no-confirm",
+        dest="no_confirm",
+        action="store_true",
+        help="start a new run without asking for interactive confirmation",
+    )
     run.add_argument("--cld", action="store_true", help="run Claude via cld and paste prompts instead of Codex")
     run.set_defaults(func=start_session)
 
@@ -1841,25 +2064,37 @@ def build_parser() -> argparse.ArgumentParser:
     controller.add_argument("--planner-pane", default="")
     controller.add_argument("--runtime-dir", default="")
     controller.add_argument("--queue-file", default="")
+    controller.add_argument("--queue-id", default="")
+    controller.add_argument("--queue-dir", default="")
+    controller.add_argument("--archive-root", default="")
+    controller.add_argument("--archive-stamp", default="")
     controller.set_defaults(func=run_controller)
 
-    attach = sub.add_parser("attach", help="attach to the last session")
-    attach.set_defaults(func=lambda args: attach_session(read_session(latest_runtime_dir(load_config_for_control(args).project_dir))))
+    attach = sub.add_parser("attach", help="attach to a tagged queue's last session")
+    attach.add_argument("queue_id", help="queue folder name under queues/")
+    attach.set_defaults(
+        func=lambda args: attach_session(read_session(latest_runtime_dir_for_args(args, load_config_for_control(args))))
+    )
 
     stop = sub.add_parser("stop-next", help="finish current prompt, then stop")
+    stop.add_argument("queue_id", help="queue folder name under queues/")
     stop.set_defaults(func=stop_next)
 
     finish = sub.add_parser("finish-sleep", help="finish the current controller wait immediately")
+    finish.add_argument("queue_id", help="queue folder name under queues/")
     finish.set_defaults(func=finish_sleep)
 
     kill_cmd = sub.add_parser("kill", help="kill the tmux session now")
+    kill_cmd.add_argument("queue_id", help="queue folder name under queues/")
     kill_cmd.add_argument("--session", default="", help="override tmux session name")
     kill_cmd.set_defaults(func=kill)
 
     stat = sub.add_parser("status", help="print JSON controller state")
+    stat.add_argument("queue_id", help="queue folder name under queues/")
     stat.set_defaults(func=status)
 
     collect = sub.add_parser("collect-prompts", help="paste prompts into files and update config.json")
+    collect.add_argument("queue_id", help="queue folder name under queues/")
     collect.add_argument("--append", action="store_true", help="append to existing config prompts instead of replacing them")
     collect.add_argument("--end-marker", default=DEFAULT_PROMPT_END_MARKER, help="line that ends one pasted prompt")
     collect.set_defaults(func=collect_prompts)

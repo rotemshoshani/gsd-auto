@@ -20,6 +20,8 @@ PULL_WATCH=0
 PULL_REMOTE="origin"
 PULL_BRANCH="dev"
 PULL_INTERVAL=30
+RESTART_HOURS="3"
+RESTART_SECONDS="10800"
 
 canonical_dir() {
   (cd "$1" && pwd -P)
@@ -203,7 +205,7 @@ fi
 
 usage() {
   cat <<EOF
-Usage: dev-env [--pull] [--override CMD1 CMD2]
+Usage: dev-env [--pull] [--override CMD1 CMD2] [--restart HOURS | --no-restart]
 
 Spawns a tmux session for the current directory:
   - row 0 (top):    controller bar — single-keypress menu
@@ -216,6 +218,8 @@ Controller keys (focus the controller pane, then press):
 Options:
   --pull                 Watch origin/dev every 30s and fast-forward dev.
   --override CMD1 CMD2   Override the top/bottom commands.
+  --restart HOURS        Restart both commands every HOURS hours (default: 3).
+  --no-restart           Disable automatic restarts.
   -h, --help             Show this help.
 
 Env: DEV_ENV_TOP, DEV_ENV_BOTTOM override the defaults.
@@ -227,6 +231,9 @@ EOF
 # ---- Controller subcommand (runs inside the tmux pane) -----------------------
 if [[ "${1:-}" == "__controller" ]]; then
   session="$2"
+  restart_seconds="${3:-0}"
+  restart_hours="${4:-}"
+  restart_deadline=0
 
   # If the controller exits for any reason, take the whole session with it.
   trap 'tmux kill-session -t "$session" 2>/dev/null || true' EXIT
@@ -246,14 +253,27 @@ if [[ "${1:-}" == "__controller" ]]; then
   RESET="${ESC}[0m"
 
   render() {
-    local top_cmd="$1" bot_cmd="$2"
+    local top_cmd="$1" bot_cmd="$2" restart_label="$3"
     printf '%s' "$CLR"
     printf '%sdev-env%s  ' "$BOLD$CYAN" "$RESET"
     printf '%s[T]%s top (%s)   ' "$BOLD" "$RESET" "$top_cmd"
     printf '%s[B]%s bottom (%s)   ' "$BOLD" "$RESET" "$bot_cmd"
     printf '%s[A]%s both   ' "$BOLD" "$RESET"
+    printf '%sauto:%s%s   ' "$DIM" "$restart_label" "$RESET"
     printf '%s[Q]%s kill' "$BOLD$RED" "$RESET"
   }
+
+  restart_both() {
+    [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id"
+    [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id"
+  }
+
+  if [[ "$restart_seconds" =~ ^[0-9]+$ ]] && (( restart_seconds > 0 )); then
+    restart_deadline=$(( $(date +%s) + restart_seconds ))
+    restart_label="${restart_hours}h"
+  else
+    restart_label="off"
+  fi
 
   while true; do
     top_id=$(tmux show-environment -t "$session" DEV_TOP_ID 2>/dev/null | cut -d= -f2-)
@@ -261,17 +281,39 @@ if [[ "${1:-}" == "__controller" ]]; then
     top_cmd=$(tmux show-environment -t "$session" DEV_TOP_CMD 2>/dev/null | cut -d= -f2-)
     bot_cmd=$(tmux show-environment -t "$session" DEV_BOT_CMD 2>/dev/null | cut -d= -f2-)
 
-    render "${top_cmd:-?}" "${bot_cmd:-?}"
+    render "${top_cmd:-?}" "${bot_cmd:-?}" "$restart_label"
 
     # Single keypress, silent, raw (-s suppresses echo, -n1 reads one char).
-    IFS= read -rsn1 key || { sleep 0.1; continue; }
+    if (( restart_deadline > 0 )); then
+      now=$(date +%s)
+      if (( now >= restart_deadline )); then
+        restart_both
+        restart_deadline=$(( now + restart_seconds ))
+        continue
+      fi
+
+      if ! IFS= read -rsn1 -t "$(( restart_deadline - now ))" key; then
+        # A timeout is the normal automatic-restart path. If read was
+        # interrupted early, loop around without restarting prematurely.
+        now=$(date +%s)
+        if (( now >= restart_deadline )); then
+          restart_both
+          restart_deadline=$(( now + restart_seconds ))
+        fi
+        continue
+      fi
+    else
+      IFS= read -rsn1 key || { sleep 0.1; continue; }
+    fi
 
     case "$key" in
       t|T) [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id" ;;
       b|B) [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id" ;;
       a|A)
-        [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id"
-        [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id"
+        restart_both
+        if (( restart_deadline > 0 )); then
+          restart_deadline=$(( $(date +%s) + restart_seconds ))
+        fi
         ;;
       q|Q)
         tmux kill-session -t "$session"
@@ -295,6 +337,28 @@ while [[ $# -gt 0 ]]; do
       BOT_CMD="$3"
       shift 3
       ;;
+    --restart)
+      [[ $# -ge 2 ]] || { echo "--restart needs HOURS" >&2; exit 1; }
+      if [[ ! "$2" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "--restart needs a positive number of hours" >&2
+        exit 1
+      fi
+      if ! RESTART_SECONDS=$(awk -v hours="$2" 'BEGIN {
+        seconds = hours * 3600
+        if (seconds < 1) exit 1
+        printf "%.0f\n", seconds
+      }'); then
+        echo "--restart must be at least one second" >&2
+        exit 1
+      fi
+      RESTART_HOURS="$2"
+      shift 2
+      ;;
+    --no-restart)
+      RESTART_HOURS="off"
+      RESTART_SECONDS="0"
+      shift
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -315,7 +379,8 @@ cleanup_tmux_session "$SESSION"
 cleanup_project_dev_processes "$PROJ_DIR"
 
 # Controller command (properly quoted for tmux's shell invocation)
-CTRL_CMD=$(printf '%q __controller %q' "$SELF" "$SESSION")
+CTRL_CMD=$(printf '%q __controller %q %q %q' \
+  "$SELF" "$SESSION" "$RESTART_SECONDS" "$RESTART_HOURS")
 
 # Detect real terminal size; tmux new-session -d defaults to 80x24 otherwise,
 # and the resulting proportional layout makes CTRL fatter after attach.
@@ -365,6 +430,7 @@ tmux set-environment -t "$SESSION" DEV_TOP_ID  "$TOP_ID"
 tmux set-environment -t "$SESSION" DEV_BOT_ID  "$BOT_ID"
 tmux set-environment -t "$SESSION" DEV_TOP_CMD "$TOP_CMD"
 tmux set-environment -t "$SESSION" DEV_BOT_CMD "$BOT_CMD"
+tmux set-environment -t "$SESSION" DEV_RESTART_HOURS "$RESTART_HOURS"
 
 # Focus the controller pane so single-keypress menu is live on attach
 tmux select-window -t "$SESSION:dev"

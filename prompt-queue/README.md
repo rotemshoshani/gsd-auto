@@ -19,29 +19,47 @@ session after every queued prompt has completed. It asks the planner to verify
 the finished work, fix issues if needed, and waits until that planner pane is
 `Ready` before marking the queue complete.
 
-All run artifacts are written under the target repo:
+Run artifacts are isolated by queue tag under the target repo:
 
 ```bash
-<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/
+<project>/.planning/work/prompt-queue/<tag>/<YYYYMMDD-HHMMSS>/
 ```
 
 ## Usage
 
-Edit `.env.local` and `config.local.json`, then run:
+Each active queue is a self-contained folder whose name is its required tag:
 
 ```bash
-./prompt-queue run
+queues/
+  customer-portal-release/
+    .env.local
+    config.json
+    prompts/
+      001-schema.md
+      002-ui.md
 ```
 
-When `config.local.json` exists, prompt-queue uses it by default. That file is
-gitignored for machine-local queues, concrete Codex session ids, and active
-prompt lists. The tracked `config.json` stays as a reusable safe default.
+Run that specific queue with the tag:
+
+```bash
+./prompt-queue run customer-portal-release
+```
+
+If `pq` aliases this repository's `./prompt-queue run`, the equivalent is:
+
+```bash
+pq customer-portal-release
+```
+
+Different tags use different tmux session names and runtime directories, so
+multiple queues can run at the same time, including against the same target
+repository.
 
 By default this runs Codex through `cdx`. To run the same queue through Claude
 instead, using `cld` and interactive paste delivery:
 
 ```bash
-./prompt-queue run --cld
+./prompt-queue run customer-portal-release --cld
 ```
 
 Starting a run shows a preflight summary before tmux launch. If a tmux session
@@ -49,33 +67,54 @@ for the same prompt queue already exists, prompt-queue asks whether to attach to
 it, replace it with a new run, or quit. In non-interactive shells, the safe
 default is to attach to the existing session instead of replacing it.
 
-When a run starts, prompt-queue looks at the latest compatible run under the
-target repo's `.planning/work/prompt-queue/` directory. Completed prompts are
-skipped automatically, so if a tmux session exits or is stopped after prompt 5,
-the next `./prompt-queue run` starts from prompt 6 without editing the config
-file. Compatibility is checked against the saved `queue.json`,
+To start a new run without the interactive confirmation prompt:
+
+```bash
+./prompt-queue run customer-portal-release --no-confirm
+```
+
+With the local `pq` alias, pass the flag directly:
+
+```bash
+pq customer-portal-release --no-confirm
+```
+
+`-y` and `--yes` are accepted aliases for `--no-confirm`.
+
+When a run starts, prompt-queue looks only at that tag's latest compatible run.
+Completed prompts are skipped automatically, so if a tmux session exits or is
+stopped after prompt 5, the next run of the same tag starts from prompt 6.
+Compatibility is checked against the saved `queue.json`,
 including prompt content hashes, so a changed prompt is not skipped by stale
 progress.
+
+After every prompt and the optional completion notification finish successfully,
+the runner moves the whole active folder to:
+
+```bash
+archive/<YYYYMMDD-HHMMSS>-<tag>/
+```
+
+Stopped or blocked queues remain under `queues/<tag>/` so they can be resumed.
 
 To build the prompt queue interactively:
 
 ```bash
-./collect-prompts
+./collect-prompts customer-portal-release
 ```
 
 For each prompt, paste the full text and finish it with a line containing only
 `::end`. When it asks for the next prompt, type `no more prompts`. The helper
-writes the prompts to `prompts/*.md` and updates the selected config file to
-reference those files. Use `--config config.local.json` for local queues.
+writes the prompts inside that queue's `prompts/` directory and updates its
+`config.json`.
 
-`.env.local` defines the repo the agent should run in:
+`queues/<tag>/.env.local` defines the repo the agent should run in:
 
 ```bash
 PROMPT_QUEUE_WORKDIR=/absolute/path/to/target-repo
 ```
 
-`config.local.json` defines the active prompt queue and reads that working
-directory:
+`queues/<tag>/config.json` defines that queue and reads its working directory:
 
 ```jsonc
 {
@@ -96,29 +135,29 @@ directory:
 }
 ```
 
-For long prompts, prefer files under this `prompt-queue` directory:
+Prompt file paths are resolved relative to the queue's config file:
 
 ```bash
 prompt-queue/
-  config.json
-  config.local.json
-  prompts/
-    database.md
-    frontend.md
+  queues/
+    customer-portal-release/
+      .env.local
+      config.json
+      prompts/
+        database.md
+        frontend.md
 ```
-
-Prompt file paths are resolved relative to the selected config file.
 
 Reattach:
 
 ```bash
-./prompt-queue attach
+./prompt-queue attach customer-portal-release
 ```
 
 Finish the current wait immediately and continue to capture/next prompt:
 
 ```bash
-./prompt-queue finish-sleep
+./prompt-queue finish-sleep customer-portal-release
 ```
 
 Toggle stopping after the current prompt. When armed, prompt-queue finishes the
@@ -126,19 +165,19 @@ current prompt, leaves the worker pane open on the completed agent, and stops
 before the next prompt:
 
 ```bash
-./prompt-queue stop-next
+./prompt-queue stop-next customer-portal-release
 ```
 
 Kill the tmux session immediately:
 
 ```bash
-./prompt-queue kill
+./prompt-queue kill customer-portal-release
 ```
 
 Print controller state:
 
 ```bash
-./prompt-queue status
+./prompt-queue status customer-portal-release
 ```
 
 ## Controller Keys
@@ -158,17 +197,24 @@ Focus the controller pane and press:
 
 ## Config
 
-Edit `.env.local` and `config.local.json`. They are the source of truth for:
+Each `queues/<tag>/` folder is self-contained. Its source-of-truth files are:
 
 - `.env.local` `PROMPT_QUEUE_WORKDIR`: repo the agent should run in
-- `config.local.json` `project_dir`: normally `${PROMPT_QUEUE_WORKDIR}`
+- `config.json` `project_dir`: normally `${PROMPT_QUEUE_WORKDIR}`
 - `prompts`: ordered queue of inline prompt objects
 - `prompt_files`: ordered queue of prompt files, resolved relative to the selected config file
 
 The default command is `cdx`, which is expected to resolve through your shell
-alias. `./prompt-queue run --cld` overrides the command to `cld` and uses
+alias. `./prompt-queue run <tag> --cld` overrides the command to `cld` and uses
 tmux bracketed paste followed by Enter to submit each prompt. The worker pane
 starts an interactive Bash shell, so aliases from `~/.bashrc` are available.
+Before worker and planner panes are created, prompt-queue refreshes tmux's
+`XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` from the invoking shell so
+Codex can reach the user-scoped services even when the tmux server is older.
+If a matching tmux session remains after its recorded controller process has
+exited, the next `pq <tag>` replaces that stale session automatically and
+resumes from the last compatible completed prompt. This also works when the
+command is entered from the failed session's own worker pane.
 
 Readiness settings:
 
@@ -231,6 +277,7 @@ Completion notification settings:
 - `completion_notify_session_id`: Codex session id to resume; defaults to `blocked_recovery_session_id`
 - `completion_notify_command`: command used for completion verification; defaults to `blocked_recovery_command` or `cdx`
 - `completion_notify_check_lines`: reserved recent planner rows setting, default `20`
+- `completion_prompt_file`: optional path relative to `config.json`; replaces the generic verification instructions while preserving runtime paths and queue evidence in the resumed prompt
 
 Completion notification has no proceed marker. The controller waits for the
 planner pane bottom line to match a ready marker, normally `Ready`.
@@ -238,7 +285,7 @@ planner pane bottom line to match a ready marker, normally `Ready`.
 Readiness samples are written to:
 
 ```bash
-<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/ready-checks/
+<project>/.planning/work/prompt-queue/<tag>/<YYYYMMDD-HHMMSS>/ready-checks/
 ```
 
 Progress and timing files are written to each run directory:
@@ -254,7 +301,7 @@ elapsed time while a prompt is active.
 `prompt_delivery: "argument_file"` writes each prompt to:
 
 ```bash
-<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/prompts/
+<project>/.planning/work/prompt-queue/<tag>/<YYYYMMDD-HHMMSS>/prompts/
 ```
 
 and launches Codex as:
@@ -266,5 +313,5 @@ cdx "$(cat <prompt-file>)"
 Captures are written to:
 
 ```bash
-<project>/.planning/work/prompt-queue/<YYYYMMDD-HHMMSS>/captures/
+<project>/.planning/work/prompt-queue/<tag>/<YYYYMMDD-HHMMSS>/captures/
 ```

@@ -25,6 +25,18 @@
           "model": ""
         },
         {
+          "label": "OpenAI GPT-5.6 Sol",
+          "model": "gpt-5.6"
+        },
+        {
+          "label": "OpenAI GPT-5.6 Terra",
+          "model": "gpt-5.6-terra"
+        },
+        {
+          "label": "OpenAI GPT-5.6 Luna",
+          "model": "gpt-5.6-luna"
+        },
+        {
           "label": "OpenAI GPT-5.5",
           "model": "gpt-5.5"
         },

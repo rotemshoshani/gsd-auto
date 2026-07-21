@@ -42,13 +42,15 @@ $queue-plan
 The skill should:
 
 - infer the target repo from the planning chat
-- write the target repo to `prompt-queue/.env.local`
-- write ordered prompt files under `prompt-queue/prompts/`
-- replace `prompt-queue/config.local.json`
+- choose a safe, descriptive queue tag
+- create a self-contained `prompt-queue/queues/<tag>/` folder
+- write the target repo to `prompt-queue/queues/<tag>/.env.local`
+- write ordered prompt files under `prompt-queue/queues/<tag>/prompts/`
+- write `prompt-queue/queues/<tag>/config.json`
 - configure `cdx`, `argument_file`, `Ready` detection, and `DO-NOT-PROCEED` blocking
 - append the blocking instruction to every executor prompt
 - validate the JSON
-- report the run command
+- report both `/absolute/path/to/prompt-queue run <tag>` and `pq <tag>`
 
 The skill should not run the tmux queue unless explicitly asked.
 
@@ -90,16 +92,18 @@ writing files.
 Workflow:
 1. Infer the target repo from the planning chat; ask one concise question if unclear.
 2. Break the plan into ordered, self-contained executor prompts.
-3. Write one markdown file per prompt under prompt-queue/prompts/.
-4. Write prompt-queue/.env.local with PROMPT_QUEUE_WORKDIR set to the target
+3. Choose a queue tag containing only letters, numbers, hyphens, and underscores.
+4. Create prompt-queue/queues/<tag>/prompts/ and write one markdown file per prompt there.
+5. Write prompt-queue/queues/<tag>/.env.local with PROMPT_QUEUE_WORKDIR set to the target
    repo absolute path.
-5. Replace prompt-queue/config.local.json with project_dir "${PROMPT_QUEUE_WORKDIR}",
+6. Write prompt-queue/queues/<tag>/config.json with project_dir "${PROMPT_QUEUE_WORKDIR}",
    command "cdx", prompt_delivery "argument_file", run_seconds 2700,
    ready_check_seconds 60, ready_check_lines 1, ready_markers ["Ready"],
    block_marker "DO-NOT-PROCEED", block_check_lines 10, prompts file
    references, and prompt_files [].
-6. Validate JSON with python3 -m json.tool.
-7. Report prompt count, target repo, env path, config path, and run command.
+7. Validate JSON with python3 -m json.tool.
+8. Report the tag, prompt count, target repo, queue folder, env path, config
+   path, absolute runner command with the tag, and pq alias command with the tag.
 
 Every executor prompt must include target repo path, planning files to read,
 exact scope, constraints, non-goals, verification commands, and an instruction

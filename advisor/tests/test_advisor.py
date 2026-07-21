@@ -94,8 +94,10 @@ class AdvisorTests(unittest.TestCase):
         with patch("advisor.fzf_select", side_effect=fake_select):
             agents = select_models(raw, topic_raw)
 
-        self.assertTrue(any("OpenAI GPT-5.5" in label for label in labels_seen))
-        self.assertEqual([agent.command for agent in agents], ["cdx --model gpt-5.5"])
+        self.assertTrue(any("OpenAI GPT-5.6 Sol" in label for label in labels_seen))
+        self.assertTrue(any("OpenAI GPT-5.6 Terra" in label for label in labels_seen))
+        self.assertTrue(any("OpenAI GPT-5.6 Luna" in label for label in labels_seen))
+        self.assertEqual([agent.command for agent in agents], ["cdx --model gpt-5.6"])
 
     def test_custom_prompt_puts_task_before_operational_instructions(self) -> None:
         raw = json.loads((Path(__file__).parents[1] / "config.json").read_text())
