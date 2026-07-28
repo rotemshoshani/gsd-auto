@@ -17,6 +17,9 @@ set -euo pipefail
 TOP_CMD="${DEV_ENV_TOP:-npx convex dev}"
 BOT_CMD="${DEV_ENV_BOTTOM:-npm run dev}"
 PULL_WATCH=0
+SYNC_WATCH=0
+REPAIR_DEPENDENCIES=0
+AUTO_RECOVER=0
 PULL_REMOTE="origin"
 PULL_BRANCH="dev"
 PULL_INTERVAL=30
@@ -116,6 +119,174 @@ timestamp() {
   date '+%Y-%m-%d %H:%M:%S'
 }
 
+dependency_fingerprint() {
+  local project_dir="$1"
+  local dependency_files=()
+  local candidate
+
+  for candidate in package.json package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
+    [[ -f "$project_dir/$candidate" ]] && dependency_files+=("$candidate")
+  done
+
+  ((${#dependency_files[@]} > 0)) || return 1
+
+  (
+    cd "$project_dir"
+    cksum "${dependency_files[@]}"
+  ) | cksum | awk '{ print $1 ":" $2 }'
+}
+
+dependency_manager() {
+  local project_dir="$1"
+
+  if [[ -f "$project_dir/package-lock.json" || -f "$project_dir/npm-shrinkwrap.json" ]]; then
+    printf 'npm\n'
+  elif [[ -f "$project_dir/pnpm-lock.yaml" ]]; then
+    printf 'pnpm\n'
+  elif [[ -f "$project_dir/yarn.lock" ]]; then
+    printf 'yarn\n'
+  elif [[ -f "$project_dir/bun.lock" || -f "$project_dir/bun.lockb" ]]; then
+    printf 'bun\n'
+  else
+    return 1
+  fi
+}
+
+dependency_stamp_file() {
+  printf '%s/dependencies.fingerprint\n' "$1"
+}
+
+dependencies_need_install() {
+  local project_dir="$1"
+  local state_dir="$2"
+  local fingerprint stamp_file installed_fingerprint=""
+
+  fingerprint="$(dependency_fingerprint "$project_dir" 2>/dev/null || true)"
+  [[ -n "$fingerprint" ]] || return 1
+
+  stamp_file="$(dependency_stamp_file "$state_dir")"
+  if [[ -f "$stamp_file" ]]; then
+    IFS= read -r installed_fingerprint <"$stamp_file" || true
+  fi
+
+  [[ ! -d "$project_dir/node_modules" || "$installed_fingerprint" != "$fingerprint" ]]
+}
+
+write_dependency_stamp() {
+  local project_dir="$1"
+  local state_dir="$2"
+  local fingerprint stamp_file temporary_stamp
+
+  fingerprint="$(dependency_fingerprint "$project_dir")"
+  stamp_file="$(dependency_stamp_file "$state_dir")"
+  temporary_stamp="${stamp_file}.tmp.$$"
+
+  mkdir -p "$state_dir"
+  (umask 077 && printf '%s\n' "$fingerprint" >"$temporary_stamp")
+  mv "$temporary_stamp" "$stamp_file"
+}
+
+install_dependencies() {
+  local project_dir="$1"
+  local state_dir="$2"
+  local manager yarn_major
+
+  manager="$(dependency_manager "$project_dir" 2>/dev/null || true)"
+  if [[ -z "$manager" ]]; then
+    printf 'dev-env: no supported lockfile found; skipping dependency install\n'
+    return 0
+  fi
+
+  printf '[%s] dev-env: rebuilding dependencies with %s\n' "$(timestamp)" "$manager"
+  (
+    cd "$project_dir"
+    case "$manager" in
+      npm)
+        command -v npm >/dev/null 2>&1 || { echo "dev-env: npm is not installed" >&2; exit 1; }
+        npm ci
+        ;;
+      pnpm)
+        command -v pnpm >/dev/null 2>&1 || { echo "dev-env: pnpm is not installed" >&2; exit 1; }
+        pnpm install --frozen-lockfile
+        ;;
+      yarn)
+        command -v yarn >/dev/null 2>&1 || { echo "dev-env: yarn is not installed" >&2; exit 1; }
+        yarn_major="$(yarn --version | cut -d. -f1)"
+        if [[ "$yarn_major" =~ ^[0-9]+$ ]] && (( yarn_major >= 2 )); then
+          yarn install --immutable
+        else
+          yarn install --frozen-lockfile
+        fi
+        ;;
+      bun)
+        command -v bun >/dev/null 2>&1 || { echo "dev-env: bun is not installed" >&2; exit 1; }
+        bun install --frozen-lockfile
+        ;;
+    esac
+  )
+  write_dependency_stamp "$project_dir" "$state_dir"
+  printf '[%s] dev-env: dependencies are synchronized\n' "$(timestamp)"
+}
+
+verify_dependency_cache() {
+  local project_dir="$1"
+  local manager
+
+  manager="$(dependency_manager "$project_dir" 2>/dev/null || true)"
+  case "$manager" in
+    npm)
+      printf '[%s] dev-env: verifying npm cache\n' "$(timestamp)"
+      (cd "$project_dir" && npm cache verify)
+      ;;
+    pnpm)
+      printf '[%s] dev-env: checking pnpm store\n' "$(timestamp)"
+      (cd "$project_dir" && pnpm store status)
+      ;;
+    yarn|bun)
+      printf 'dev-env: %s has no safe generic cache verification step; continuing with a frozen install\n' "$manager"
+      ;;
+    *)
+      printf 'dev-env: no supported lockfile found; skipping cache verification\n'
+      ;;
+  esac
+}
+
+tmux_environment_value() {
+  local session="$1"
+  local name="$2"
+
+  tmux show-environment -t "$session" "$name" 2>/dev/null | cut -d= -f2- || true
+}
+
+pause_workers() {
+  local session="$1"
+  local top_id bot_id paused_run
+
+  top_id="$(tmux_environment_value "$session" DEV_TOP_ID)"
+  bot_id="$(tmux_environment_value "$session" DEV_BOT_ID)"
+  paused_run="$(tmux_environment_value "$session" DEV_PAUSED_RUN)"
+
+  printf '[%s] dev-env: pausing dev servers for dependency installation\n' "$(timestamp)"
+  [[ -n "$top_id" && -n "$paused_run" ]] && tmux respawn-pane -k -t "$top_id" "$paused_run"
+  [[ -n "$bot_id" && -n "$paused_run" ]] && tmux respawn-pane -k -t "$bot_id" "$paused_run"
+  return 0
+}
+
+restart_workers() {
+  local session="$1"
+  local top_id bot_id top_run bot_run
+
+  top_id="$(tmux_environment_value "$session" DEV_TOP_ID)"
+  bot_id="$(tmux_environment_value "$session" DEV_BOT_ID)"
+  top_run="$(tmux_environment_value "$session" DEV_TOP_RUN)"
+  bot_run="$(tmux_environment_value "$session" DEV_BOT_RUN)"
+
+  printf '[%s] dev-env: restarting dev servers\n' "$(timestamp)"
+  [[ -n "$top_id" && -n "$top_run" ]] && tmux respawn-pane -k -t "$top_id" "$top_run"
+  [[ -n "$bot_id" && -n "$bot_run" ]] && tmux respawn-pane -k -t "$bot_id" "$bot_run"
+  return 0
+}
+
 pull_once() {
   local project_dir="$1"
   local remote="$2"
@@ -150,6 +321,70 @@ pull_once() {
   )
 }
 
+sync_once() {
+  local project_dir="$1"
+  local remote="$2"
+  local branch="$3"
+  local session="$4"
+  local state_dir="$5"
+  local current_branch local_ref remote_ref changed_files=""
+  local pulled=0 restarted=0
+
+  (
+    cd "$project_dir"
+
+    printf '\n[%s] dev-env: checking gh in...\n' "$(timestamp)"
+    printf '[%s] dev-env: fetching %s/%s\n' "$(timestamp)" "$remote" "$branch"
+    git fetch "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch"
+
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+    if [[ "$current_branch" != "$branch" ]]; then
+      printf 'dev-env: current branch is %s; skipping automatic sync for %s\n' "${current_branch:-detached}" "$branch"
+      git status --short --branch
+      return 0
+    fi
+
+    local_ref="$(git rev-parse --verify "$branch" 2>/dev/null || true)"
+    remote_ref="$(git rev-parse --verify "$remote/$branch" 2>/dev/null || true)"
+
+    if [[ -n "$local_ref" && -n "$remote_ref" && "$local_ref" != "$remote_ref" ]]; then
+      if git merge-base --is-ancestor "$local_ref" "$remote_ref"; then
+        changed_files="$(git diff --name-only "$local_ref" "$remote_ref")"
+        printf 'dev-env: diff found - pulling...\n'
+        printf 'dev-env: %s/%s changed; fast-forwarding %s\n' "$remote" "$branch" "$branch"
+        git pull --ff-only "$remote" "$branch"
+        printf 'dev-env: pull finished\n'
+        pulled=1
+      elif git merge-base --is-ancestor "$remote_ref" "$local_ref"; then
+        printf 'dev-env: local %s is ahead of %s/%s; leaving it unchanged\n' "$branch" "$remote" "$branch"
+      else
+        printf 'dev-env: local %s and %s/%s diverged; refusing automatic reconciliation\n' "$branch" "$remote" "$branch" >&2
+        git status --short --branch
+        return 1
+      fi
+    fi
+
+    if dependencies_need_install "$project_dir" "$state_dir"; then
+      pause_workers "$session"
+      if install_dependencies "$project_dir" "$state_dir"; then
+        restart_workers "$session"
+        restarted=1
+      else
+        printf 'dev-env: dependency installation failed; dev servers remain paused and sync will retry\n' >&2
+        return 1
+      fi
+    fi
+
+    if [[ "$pulled" == "1" && "$restarted" == "0" ]] &&
+       grep -Eq '(^|/)(next\.config\.[^/]+|tsconfig\.json|convex\.json|middleware\.[^/]+|proxy\.[^/]+|\.nvmrc|\.node-version)$' <<<"$changed_files"; then
+      printf 'dev-env: runtime configuration changed\n'
+      restart_workers "$session"
+    fi
+
+    git status --short --branch
+  )
+}
+
 pull_watcher() {
   local project_dir="$1"
   local remote="$2"
@@ -162,16 +397,57 @@ pull_watcher() {
   done
 }
 
+sync_watcher() {
+  local project_dir="$1"
+  local remote="$2"
+  local branch="$3"
+  local interval="$4"
+  local session="$5"
+  local state_dir="$6"
+
+  while true; do
+    sync_once "$project_dir" "$remote" "$branch" "$session" "$state_dir" || true
+    sleep "$interval"
+  done
+}
+
 # ---- Runner subcommand (wraps each worker pane) ------------------------------
 # Keeps the pane alive after the command exits/crashes, so the user can read
 # the final output and restart it via the controller. Avoids the race where
 # `remain-on-exit on` is set too late.
 if [[ "${1:-}" == "__runner" ]]; then
   shift
+  command_to_run="$1"
+  auto_recover="${2:-0}"
   set +e
-  bash -c "$1"
-  ec=$?
-  printf '\n\033[1;31m[exited code=%d]\033[0m  Use the controller above to restart.\n' "$ec"
+
+  if [[ "$auto_recover" != "1" ]]; then
+    bash -c "$command_to_run"
+    ec=$?
+    printf '\n\033[1;31m[exited code=%d]\033[0m  Use the controller above to restart.\n' "$ec"
+    while true; do sleep 3600; done
+  fi
+
+  recovery_delay=5
+  while true; do
+    started_at="$(date +%s)"
+    bash -c "$command_to_run"
+    ec=$?
+    runtime=$(( $(date +%s) - started_at ))
+    if (( runtime >= 60 )); then
+      recovery_delay=5
+    fi
+    printf '\n\033[1;31m[exited code=%d]\033[0m  Auto-restarting in %ss.\n' "$ec" "$recovery_delay"
+    sleep "$recovery_delay"
+    if (( recovery_delay < 120 )); then
+      recovery_delay=$(( recovery_delay * 2 ))
+      (( recovery_delay > 120 )) && recovery_delay=120
+    fi
+  done
+fi
+
+if [[ "${1:-}" == "__paused" ]]; then
+  printf '\033[1;33mdev-env: paused while dependencies are synchronized\033[0m\n'
   while true; do sleep 3600; done
 fi
 
@@ -203,9 +479,24 @@ if [[ "${1:-}" == "__pull_watcher" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "__sync_once" ]]; then
+  shift
+  [[ $# -eq 5 ]] || { echo "__sync_once needs PROJECT_DIR REMOTE BRANCH SESSION STATE_DIR" >&2; exit 1; }
+  sync_once "$1" "$2" "$3" "$4" "$5"
+  exit 0
+fi
+
+if [[ "${1:-}" == "__sync_watcher" ]]; then
+  shift
+  [[ $# -eq 6 ]] || { echo "__sync_watcher needs PROJECT_DIR REMOTE BRANCH INTERVAL SESSION STATE_DIR" >&2; exit 1; }
+  sync_watcher "$1" "$2" "$3" "$4" "$5" "$6"
+  exit 0
+fi
+
 usage() {
   cat <<EOF
-Usage: dev-env [--pull] [--override CMD1 CMD2] [--restart HOURS | --no-restart]
+Usage: dev-env [--pull | --sync] [--interval SECONDS] [--repair]
+               [--override CMD1 CMD2] [--restart HOURS | --no-restart]
 
 Spawns a tmux session for the current directory:
   - row 0 (top):    controller bar — single-keypress menu
@@ -217,6 +508,11 @@ Controller keys (focus the controller pane, then press):
 
 Options:
   --pull                 Watch origin/dev every 30s and fast-forward dev.
+  --sync                 Pull like --pull, install changed dependencies, restart
+                         for runtime-config changes, and recover crashed workers.
+  --interval SECONDS     Poll interval for --pull/--sync (default: 30, minimum: 5).
+  --repair               Verify the package-manager cache and rebuild dependencies
+                         before starting the dev environment.
   --override CMD1 CMD2   Override the top/bottom commands.
   --restart HOURS        Restart both commands every HOURS hours (default: 3).
   --no-restart           Disable automatic restarts.
@@ -253,19 +549,20 @@ if [[ "${1:-}" == "__controller" ]]; then
   RESET="${ESC}[0m"
 
   render() {
-    local top_cmd="$1" bot_cmd="$2" restart_label="$3"
+    local top_cmd="$1" bot_cmd="$2" restart_label="$3" sync_label="$4"
     printf '%s' "$CLR"
     printf '%sdev-env%s  ' "$BOLD$CYAN" "$RESET"
     printf '%s[T]%s top (%s)   ' "$BOLD" "$RESET" "$top_cmd"
     printf '%s[B]%s bottom (%s)   ' "$BOLD" "$RESET" "$bot_cmd"
     printf '%s[A]%s both   ' "$BOLD" "$RESET"
     printf '%sauto:%s%s   ' "$DIM" "$restart_label" "$RESET"
+    printf '%ssync:%s%s   ' "$DIM" "$sync_label" "$RESET"
     printf '%s[Q]%s kill' "$BOLD$RED" "$RESET"
   }
 
   restart_both() {
-    [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id"
-    [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id"
+    [[ -n "$top_id" && -n "$top_run" ]] && tmux respawn-pane -k -t "$top_id" "$top_run"
+    [[ -n "$bot_id" && -n "$bot_run" ]] && tmux respawn-pane -k -t "$bot_id" "$bot_run"
   }
 
   if [[ "$restart_seconds" =~ ^[0-9]+$ ]] && (( restart_seconds > 0 )); then
@@ -280,8 +577,11 @@ if [[ "${1:-}" == "__controller" ]]; then
     bot_id=$(tmux show-environment -t "$session" DEV_BOT_ID 2>/dev/null | cut -d= -f2-)
     top_cmd=$(tmux show-environment -t "$session" DEV_TOP_CMD 2>/dev/null | cut -d= -f2-)
     bot_cmd=$(tmux show-environment -t "$session" DEV_BOT_CMD 2>/dev/null | cut -d= -f2-)
+    top_run=$(tmux show-environment -t "$session" DEV_TOP_RUN 2>/dev/null | cut -d= -f2-)
+    bot_run=$(tmux show-environment -t "$session" DEV_BOT_RUN 2>/dev/null | cut -d= -f2-)
+    sync_label=$(tmux show-environment -t "$session" DEV_SYNC_LABEL 2>/dev/null | cut -d= -f2-)
 
-    render "${top_cmd:-?}" "${bot_cmd:-?}" "$restart_label"
+    render "${top_cmd:-?}" "${bot_cmd:-?}" "$restart_label" "${sync_label:-off}"
 
     # Single keypress, silent, raw (-s suppresses echo, -n1 reads one char).
     if (( restart_deadline > 0 )); then
@@ -307,8 +607,8 @@ if [[ "${1:-}" == "__controller" ]]; then
     fi
 
     case "$key" in
-      t|T) [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id" ;;
-      b|B) [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id" ;;
+      t|T) [[ -n "$top_id" ]] && tmux respawn-pane -k -t "$top_id" "$top_run" ;;
+      b|B) [[ -n "$bot_id" ]] && tmux respawn-pane -k -t "$bot_id" "$bot_run" ;;
       a|A)
         restart_both
         if (( restart_deadline > 0 )); then
@@ -329,6 +629,25 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --pull)
       PULL_WATCH=1
+      shift
+      ;;
+    --sync)
+      PULL_WATCH=1
+      SYNC_WATCH=1
+      AUTO_RECOVER=1
+      shift
+      ;;
+    --interval)
+      [[ $# -ge 2 ]] || { echo "--interval needs SECONDS" >&2; exit 1; }
+      if [[ ! "$2" =~ ^[0-9]+$ ]] || (( 10#$2 < 5 )); then
+        echo "--interval needs a whole number of at least 5 seconds" >&2
+        exit 1
+      fi
+      PULL_INTERVAL="$((10#$2))"
+      shift 2
+      ;;
+    --repair)
+      REPAIR_DEPENDENCIES=1
       shift
       ;;
     --override)
@@ -372,11 +691,27 @@ fi
 PROJ_DIR="$(pwd)"
 SELF="$(readlink -f "$0")"
 SESSION="dev-$(basename "$PROJ_DIR" | tr -c '[:alnum:]_-' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
+PROJECT_CACHE_KEY="$(printf '%s' "$(canonical_dir "$PROJ_DIR")" | cksum | awk '{ print $1 }')"
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+  CACHE_ROOT="$XDG_CACHE_HOME/dev-env"
+elif [[ -n "${HOME:-}" ]]; then
+  CACHE_ROOT="$HOME/.cache/dev-env"
+else
+  CACHE_ROOT="/tmp/dev-env-${UID:-user}"
+fi
+STATE_DIR="$CACHE_ROOT/${SESSION#dev-}-$PROJECT_CACHE_KEY"
 
 # Start fresh if the same project already has a dev-env session or loose dev
 # processes from a regular terminal.
 cleanup_tmux_session "$SESSION"
 cleanup_project_dev_processes "$PROJ_DIR"
+
+if [[ "$REPAIR_DEPENDENCIES" == "1" ]]; then
+  verify_dependency_cache "$PROJ_DIR"
+  install_dependencies "$PROJ_DIR" "$STATE_DIR"
+elif [[ "$SYNC_WATCH" == "1" ]] && dependencies_need_install "$PROJ_DIR" "$STATE_DIR"; then
+  install_dependencies "$PROJ_DIR" "$STATE_DIR"
+fi
 
 # Controller command (properly quoted for tmux's shell invocation)
 CTRL_CMD=$(printf '%q __controller %q %q %q' \
@@ -404,8 +739,9 @@ tmux set-option -t "$SESSION" window-status-current-format " "
 tmux set-option -t "$SESSION" status-justify left
 
 # Worker commands run through __runner so they survive exit/crash
-TOP_RUN=$(printf '%q __runner %q' "$SELF" "$TOP_CMD")
-BOT_RUN=$(printf '%q __runner %q' "$SELF" "$BOT_CMD")
+TOP_RUN=$(printf '%q __runner %q %q' "$SELF" "$TOP_CMD" "$AUTO_RECOVER")
+BOT_RUN=$(printf '%q __runner %q %q' "$SELF" "$BOT_CMD" "$AUTO_RECOVER")
+PAUSED_RUN=$(printf '%q __paused' "$SELF")
 
 # Split TOP off the controller. Size the NEW pane (TOP) so CTRL ends up at 1 row.
 # `-l N` sets the new pane to N lines. Account for the 1-row pane border:
@@ -414,12 +750,6 @@ WIN_H=$(tmux display-message -p -t "$CTRL_ID" '#{window_height}')
 TOP_SIZE=$(( WIN_H > 4 ? WIN_H - 2 : WIN_H / 2 ))
 TOP_ID=$(tmux split-window -t "$CTRL_ID" -v -l "$TOP_SIZE" -c "$PROJ_DIR" \
            -P -F '#{pane_id}' "$TOP_RUN")
-
-if [[ "$PULL_WATCH" == "1" ]]; then
-  PULL_CMD=$(printf '%q __pull_watcher %q %q %q %q' "$SELF" "$PROJ_DIR" "$PULL_REMOTE" "$PULL_BRANCH" "$PULL_INTERVAL")
-  tmux split-window -t "$TOP_ID" -v -b -l 1 -c "$PROJ_DIR" \
-    -P -F '#{pane_id}' "$PULL_CMD" >/dev/null
-fi
 
 # Split TOP evenly into TOP/BOTTOM (no -l → tmux splits 50/50)
 BOT_ID=$(tmux split-window -t "$TOP_ID" -v -c "$PROJ_DIR" \
@@ -430,7 +760,29 @@ tmux set-environment -t "$SESSION" DEV_TOP_ID  "$TOP_ID"
 tmux set-environment -t "$SESSION" DEV_BOT_ID  "$BOT_ID"
 tmux set-environment -t "$SESSION" DEV_TOP_CMD "$TOP_CMD"
 tmux set-environment -t "$SESSION" DEV_BOT_CMD "$BOT_CMD"
+tmux set-environment -t "$SESSION" DEV_TOP_RUN "$TOP_RUN"
+tmux set-environment -t "$SESSION" DEV_BOT_RUN "$BOT_RUN"
+tmux set-environment -t "$SESSION" DEV_PAUSED_RUN "$PAUSED_RUN"
 tmux set-environment -t "$SESSION" DEV_RESTART_HOURS "$RESTART_HOURS"
+if [[ "$SYNC_WATCH" == "1" ]]; then
+  tmux set-environment -t "$SESSION" DEV_SYNC_LABEL "${PULL_INTERVAL}s"
+elif [[ "$PULL_WATCH" == "1" ]]; then
+  tmux set-environment -t "$SESSION" DEV_SYNC_LABEL "pull:${PULL_INTERVAL}s"
+else
+  tmux set-environment -t "$SESSION" DEV_SYNC_LABEL "off"
+fi
+
+if [[ "$PULL_WATCH" == "1" ]]; then
+  if [[ "$SYNC_WATCH" == "1" ]]; then
+    PULL_CMD=$(printf '%q __sync_watcher %q %q %q %q %q %q' \
+      "$SELF" "$PROJ_DIR" "$PULL_REMOTE" "$PULL_BRANCH" "$PULL_INTERVAL" "$SESSION" "$STATE_DIR")
+  else
+    PULL_CMD=$(printf '%q __pull_watcher %q %q %q %q' \
+      "$SELF" "$PROJ_DIR" "$PULL_REMOTE" "$PULL_BRANCH" "$PULL_INTERVAL")
+  fi
+  tmux split-window -t "$TOP_ID" -v -b -l 1 -c "$PROJ_DIR" \
+    -P -F '#{pane_id}' "$PULL_CMD" >/dev/null
+fi
 
 # Focus the controller pane so single-keypress menu is live on attach
 tmux select-window -t "$SESSION:dev"

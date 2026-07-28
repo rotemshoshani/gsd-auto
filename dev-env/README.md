@@ -77,6 +77,53 @@ Every 30 seconds it fetches `origin/dev`, prints `git status --short --branch`,
 and fast-forwards the local `dev` branch when `origin/dev` changes. It does
 not restart the dev panes.
 
+For a laptop or test machine that should continuously follow another
+development machine, use sync mode:
+
+```bash
+dev-env --sync
+```
+
+`--sync` includes the pull watcher and adds dependency-aware recovery:
+
+- It fast-forwards only. Local commits, a different branch, or diverged history
+  are never reset, stashed, or reconciled automatically.
+- It fingerprints `package.json` and the detected lockfile. When that
+  fingerprint changes, it pauses both workers, performs a frozen clean install,
+  and restarts them.
+- It supports npm, pnpm, Yarn, and Bun lockfiles. The corresponding commands are
+  `npm ci`, `pnpm install --frozen-lockfile`, Yarn's immutable/frozen install,
+  and `bun install --frozen-lockfile`.
+- Runtime configuration changes such as `next.config.*`, `tsconfig.json`, and
+  `convex.json` restart both workers. Normal source changes are left to the
+  frameworks' hot reloaders.
+- A worker that exits is restarted with exponential backoff, capped at two
+  minutes.
+
+Dependency fingerprints live under `~/.cache/dev-env/` (or
+`$XDG_CACHE_HOME/dev-env/`), keyed by the canonical project path. No state is
+written into the project.
+
+Change the polling interval for either watcher:
+
+```bash
+dev-env --sync --interval 60
+dev-env --pull --interval 15
+```
+
+The default is 30 seconds and the minimum is 5 seconds. Polling happens only
+while the tmux environment is running.
+
+To repair the local dependency installation before launching:
+
+```bash
+dev-env --repair --sync
+```
+
+`--repair` verifies the package-manager cache when a safe generic check exists,
+then performs the same frozen clean install. It does not edit manifests,
+lockfiles, dotenv files, or source files. It also does not run `npm audit fix`.
+
 Change the automatic restart interval (in hours), or disable it:
 
 ```bash

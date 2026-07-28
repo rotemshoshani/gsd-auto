@@ -71,3 +71,27 @@ if ! grep -q '^split-window .* -l 1 .*__pull_watcher' "$log_file"; then
   cat "$log_file" >&2
   exit 1
 fi
+
+: >"$log_file"
+printf '0\n' >"$pane_counter"
+
+(
+  cd "$project_dir"
+  DEV_ENV_TMUX_LOG="$log_file" \
+    DEV_ENV_TMUX_COUNTER="$pane_counter" \
+    PATH="$stub_bin:$PATH" \
+    "$repo_root/dev-env" --sync --interval 45 >/dev/null 2>&1
+)
+
+split_count="$(grep -c '^split-window ' "$log_file")"
+if [[ "$split_count" != "3" ]]; then
+  echo "expected --sync layout to create top, sync, and bottom panes; saw $split_count split-window calls" >&2
+  cat "$log_file" >&2
+  exit 1
+fi
+
+if ! grep -q '^split-window .* -l 1 .*__sync_watcher.*45' "$log_file"; then
+  echo "expected sync watcher to run every 45 seconds in a 1-row pane" >&2
+  cat "$log_file" >&2
+  exit 1
+fi
