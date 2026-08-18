@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "aliases": {
+    "local-dev": {
+      "provider": "local",
+      "path": ".env.local"
+    },
+    "convex-dev": {
+      "provider": "convex",
+      "deployment": "team-slug:project-slug:dev/user"
+    },
+    "vercel-preview": {
+      "provider": "vercel",
+      "project": "project-name",
+      "scope": "team-slug",
+      "environment": "preview"
+    }
+  }
+}

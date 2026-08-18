@@ -14,8 +14,8 @@
 
 set -euo pipefail
 
-TOP_CMD="${DEV_ENV_TOP:-npx convex dev}"
-BOT_CMD="${DEV_ENV_BOTTOM:-npm run dev}"
+TOP_CMD="npx convex dev"
+BOT_CMD="npm run dev"
 PULL_WATCH=0
 SYNC_WATCH=0
 REPAIR_DEPENDENCIES=0
@@ -28,6 +28,65 @@ RESTART_SECONDS="10800"
 
 canonical_dir() {
   (cd "$1" && pwd -P)
+}
+
+set_restart_hours() {
+  local hours="$1"
+
+  if [[ "$hours" == "off" ]]; then
+    RESTART_HOURS="off"
+    RESTART_SECONDS="0"
+    return 0
+  fi
+  if [[ ! "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "dev-env: restart hours must be a positive number or 'off'" >&2
+    return 1
+  fi
+  if ! RESTART_SECONDS=$(awk -v hours="$hours" 'BEGIN {
+    seconds = hours * 3600
+    if (seconds < 1) exit 1
+    printf "%.0f\\n", seconds
+  }'); then
+    echo "dev-env: restart hours must be at least one second" >&2
+    return 1
+  fi
+  RESTART_HOURS="$hours"
+}
+
+set_mode() {
+  case "$1" in
+    normal) PULL_WATCH=0; SYNC_WATCH=0; AUTO_RECOVER=0 ;;
+    pull)   PULL_WATCH=1; SYNC_WATCH=0; AUTO_RECOVER=0 ;;
+    sync)   PULL_WATCH=1; SYNC_WATCH=1; AUTO_RECOVER=1 ;;
+    *) echo "dev-env: mode must be normal, pull, or sync" >&2; return 1 ;;
+  esac
+}
+
+load_project_config() {
+  local config_path="$1" config_output key value
+  [[ -f "$config_path" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || {
+    echo "dev-env: python3 is required to read $config_path" >&2
+    return 1
+  }
+  config_output="$(mktemp)"
+  if ! python3 "$2" "$config_path" dev_env >"$config_output"; then
+    rm -f "$config_output"
+    return 1
+  fi
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    case "$key" in
+      top_command) TOP_CMD="$value" ;;
+      bottom_command) BOT_CMD="$value" ;;
+      mode) set_mode "$value" || { rm -f "$config_output"; return 1; } ;;
+      repair) [[ "$value" == "true" ]] && REPAIR_DEPENDENCIES=1 || REPAIR_DEPENDENCIES=0 ;;
+      remote) PULL_REMOTE="$value" ;;
+      branch) PULL_BRANCH="$value" ;;
+      interval_seconds) PULL_INTERVAL="$value" ;;
+      restart_hours) set_restart_hours "$value" || { rm -f "$config_output"; return 1; } ;;
+    esac
+  done <"$config_output"
+  rm -f "$config_output"
 }
 
 process_cwd() {
@@ -493,9 +552,28 @@ if [[ "${1:-}" == "__sync_watcher" ]]; then
   exit 0
 fi
 
+PROJ_DIR="$(pwd)"
+SELF="$(readlink -f "$0")"
+UTILITIES_ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+load_project_config "$PROJ_DIR/.rsh-utils.json" "$UTILITIES_ROOT/shared/project_config.py"
+
+[[ -v DEV_ENV_TOP ]] && TOP_CMD="$DEV_ENV_TOP"
+[[ -v DEV_ENV_BOTTOM ]] && BOT_CMD="$DEV_ENV_BOTTOM"
+[[ -v DEV_ENV_MODE ]] && set_mode "$DEV_ENV_MODE"
+if [[ -v DEV_ENV_REPAIR ]]; then
+  case "$DEV_ENV_REPAIR" in true|1) REPAIR_DEPENDENCIES=1 ;; false|0) REPAIR_DEPENDENCIES=0 ;; *) echo "dev-env: DEV_ENV_REPAIR must be true/false or 1/0" >&2; exit 1 ;; esac
+fi
+[[ -v DEV_ENV_PULL_REMOTE ]] && PULL_REMOTE="$DEV_ENV_PULL_REMOTE"
+[[ -v DEV_ENV_PULL_BRANCH ]] && PULL_BRANCH="$DEV_ENV_PULL_BRANCH"
+if [[ -v DEV_ENV_PULL_INTERVAL ]]; then
+  [[ "$DEV_ENV_PULL_INTERVAL" =~ ^[0-9]+$ ]] && (( 10#$DEV_ENV_PULL_INTERVAL >= 5 )) || { echo "dev-env: DEV_ENV_PULL_INTERVAL must be a whole number of at least 5" >&2; exit 1; }
+  PULL_INTERVAL="$((10#$DEV_ENV_PULL_INTERVAL))"
+fi
+[[ -v DEV_ENV_RESTART_HOURS ]] && set_restart_hours "$DEV_ENV_RESTART_HOURS"
+
 usage() {
   cat <<EOF
-Usage: dev-env [--pull | --sync] [--interval SECONDS] [--repair]
+Usage: dev-env [--pull | --sync | --no-pull | --no-sync] [--interval SECONDS] [--repair | --no-repair]
                [--override CMD1 CMD2] [--restart HOURS | --no-restart]
 
 Spawns a tmux session for the current directory:
@@ -510,15 +588,19 @@ Options:
   --pull                 Watch origin/dev every 30s and fast-forward dev.
   --sync                 Pull like --pull, install changed dependencies, restart
                          for runtime-config changes, and recover crashed workers.
+  --no-pull, --no-sync   Disable a pull/sync mode selected by project config.
   --interval SECONDS     Poll interval for --pull/--sync (default: 30, minimum: 5).
   --repair               Verify the package-manager cache and rebuild dependencies
                          before starting the dev environment.
+  --no-repair            Skip repair selected by project config.
   --override CMD1 CMD2   Override the top/bottom commands.
   --restart HOURS        Restart both commands every HOURS hours (default: 3).
   --no-restart           Disable automatic restarts.
   -h, --help             Show this help.
 
-Env: DEV_ENV_TOP, DEV_ENV_BOTTOM override the defaults.
+Project config: .rsh-utils.json in the current directory. CLI > environment > config > defaults.
+Env: DEV_ENV_TOP, DEV_ENV_BOTTOM, DEV_ENV_MODE, DEV_ENV_REPAIR,
+     DEV_ENV_PULL_REMOTE, DEV_ENV_PULL_BRANCH, DEV_ENV_PULL_INTERVAL, DEV_ENV_RESTART_HOURS.
 
 Re-running in a directory with an existing session replaces it with a fresh one.
 EOF
@@ -628,13 +710,15 @@ fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pull)
-      PULL_WATCH=1
+      set_mode pull
       shift
       ;;
     --sync)
-      PULL_WATCH=1
-      SYNC_WATCH=1
-      AUTO_RECOVER=1
+      set_mode sync
+      shift
+      ;;
+    --no-pull|--no-sync)
+      set_mode normal
       shift
       ;;
     --interval)
@@ -650,6 +734,10 @@ while [[ $# -gt 0 ]]; do
       REPAIR_DEPENDENCIES=1
       shift
       ;;
+    --no-repair)
+      REPAIR_DEPENDENCIES=0
+      shift
+      ;;
     --override)
       [[ $# -ge 3 ]] || { echo "--override needs 2 args: CMD1 CMD2" >&2; exit 1; }
       TOP_CMD="$2"
@@ -658,19 +746,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --restart)
       [[ $# -ge 2 ]] || { echo "--restart needs HOURS" >&2; exit 1; }
-      if [[ ! "$2" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        echo "--restart needs a positive number of hours" >&2
-        exit 1
-      fi
-      if ! RESTART_SECONDS=$(awk -v hours="$2" 'BEGIN {
-        seconds = hours * 3600
-        if (seconds < 1) exit 1
-        printf "%.0f\n", seconds
-      }'); then
-        echo "--restart must be at least one second" >&2
-        exit 1
-      fi
-      RESTART_HOURS="$2"
+      set_restart_hours "$2" || exit 1
       shift 2
       ;;
     --no-restart)
@@ -688,8 +764,6 @@ if [[ "$PULL_WATCH" == "1" ]]; then
   command -v git >/dev/null 2>&1 || { echo "dev-env: git not installed" >&2; exit 1; }
 fi
 
-PROJ_DIR="$(pwd)"
-SELF="$(readlink -f "$0")"
 SESSION="dev-$(basename "$PROJ_DIR" | tr -c '[:alnum:]_-' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
 PROJECT_CACHE_KEY="$(printf '%s' "$(canonical_dir "$PROJ_DIR")" | cksum | awk '{ print $1 }')"
 if [[ -n "${XDG_CACHE_HOME:-}" ]]; then

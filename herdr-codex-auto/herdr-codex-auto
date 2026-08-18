@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PROMPT_TEXT="Would you like to run the following command?"
+readonly DEFAULT_APPROVAL_KEY="p"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  herdr-codex-auto [--pane PANE_ID] [--key KEY] [--once]
+
+Watch Codex panes in the current Herdr workspace and press "p" when Codex
+shows its command-permission prompt. Other blocked states, including questions,
+are left for the user.
+
+Modes:
+  (default)  Watch every Codex pane that is already running in this workspace.
+  --pane ID  Watch one existing Codex pane in this workspace.
+
+Options:
+  -k, --key KEY  Key to send on a command-permission prompt (default: p).
+      --once     Check the selected panes once without waiting for a prompt.
+  -h, --help     Show this help.
+
+Examples:
+  herdr-codex-auto
+  herdr-codex-auto --pane w1:p2
+EOF
+}
+
+die() {
+  printf 'herdr-codex-auto: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+log() {
+  printf '[herdr-codex-auto] %s\n' "$*" >&2
+}
+
+agent_list() {
+  herdr agent list
+}
+
+selected_panes() {
+  local workspace_id="$1"
+  local requested_pane="$2"
+  local exclude_pane="$3"
+  local agents_json
+
+  agents_json="$(agent_list)" || die "could not list Herdr agents"
+
+  if [[ -n "$requested_pane" ]]; then
+    if ! jq -e \
+      --arg workspace "$workspace_id" \
+      --arg pane "$requested_pane" \
+      '.result.agents[] | select(
+        .workspace_id == $workspace and
+        .pane_id == $pane and
+        ((.agent // "") | ascii_downcase) == "codex"
+      )' <<<"$agents_json" >/dev/null; then
+      die "pane $requested_pane is not a running Codex pane in workspace $workspace_id"
+    fi
+    printf '%s\n' "$requested_pane"
+    return
+  fi
+
+  jq -r \
+    --arg workspace "$workspace_id" \
+    --arg exclude "$exclude_pane" \
+    '.result.agents[] | select(
+      .workspace_id == $workspace and
+      .pane_id != $exclude and
+      ((.agent // "") | ascii_downcase) == "codex"
+    ) | .pane_id' <<<"$agents_json"
+}
+
+pane_status() {
+  local pane_id="$1"
+  local agents_json
+
+  agents_json="$(agent_list)" || return 1
+  jq -r --arg pane "$pane_id" \
+    '.result.agents[] | select(.pane_id == $pane) | .agent_status' \
+    <<<"$agents_json" | head -n 1
+}
+
+is_current_codex_target() {
+  local pane_id="$1"
+  local workspace_id="$2"
+  local agents_json
+
+  agents_json="$(agent_list)" || return 1
+  jq -e \
+    --arg workspace "$workspace_id" \
+    --arg pane "$pane_id" \
+    '.result.agents[] | select(
+      .workspace_id == $workspace and
+      .pane_id == $pane and
+      ((.agent // "") | ascii_downcase) == "codex"
+    )' <<<"$agents_json" >/dev/null
+}
+
+approve_if_permission_prompt() {
+  local pane_id="$1"
+  local workspace_id="$2"
+  local approval_key="$3"
+  local screen
+
+  if ! is_current_codex_target "$pane_id" "$workspace_id"; then
+    return 2
+  fi
+
+  screen="$(herdr agent read "$pane_id" --source visible --lines 80 2>/dev/null)" || return 2
+
+  if grep -Fq -- "$PROMPT_TEXT" <<<"$screen"; then
+    herdr pane send-keys "$pane_id" "$approval_key" >/dev/null
+    log "$pane_id: command permission detected; sent $approval_key"
+    return 0
+  fi
+
+  log "$pane_id: blocked for non-permission input; leaving it untouched"
+  return 1
+}
+
+monitor_pane() {
+  local pane_id="$1"
+  local workspace_id="$2"
+  local approval_key="$3"
+
+  log "$pane_id: watching for Codex command permissions"
+
+  while herdr wait agent-status "$pane_id" --status blocked >/dev/null 2>&1; do
+    approve_if_permission_prompt "$pane_id" "$workspace_id" "$approval_key" || {
+      case "$?" in
+        1) ;;
+        *) break ;;
+      esac
+    }
+
+    # A blocked wait resolves immediately while the prompt remains on screen.
+    # Waiting for Codex to resume makes this loop edge-triggered without polling.
+    if ! herdr wait agent-status "$pane_id" --status working >/dev/null 2>&1; then
+      break
+    fi
+  done
+
+  log "$pane_id: Codex is no longer available; watcher stopped"
+}
+
+check_pane_once() {
+  local pane_id="$1"
+  local workspace_id="$2"
+  local approval_key="$3"
+  local status
+
+  status="$(pane_status "$pane_id")" || return 0
+  if [[ "$status" == "blocked" ]]; then
+    approve_if_permission_prompt "$pane_id" "$workspace_id" "$approval_key" || true
+  fi
+}
+
+main() {
+  local requested_pane=""
+  local approval_key="$DEFAULT_APPROVAL_KEY"
+  local once=0
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --pane)
+        [[ "$#" -ge 2 ]] || die "missing value for --pane"
+        requested_pane="$2"
+        shift 2
+        ;;
+      -k|--key)
+        [[ "$#" -ge 2 ]] || die "missing value for $1"
+        approval_key="$2"
+        shift 2
+        ;;
+      --once)
+        once=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+
+  [[ "${HERDR_ENV:-}" == "1" ]] || die "must be run inside a Herdr-managed pane"
+  [[ -n "${HERDR_WORKSPACE_ID:-}" ]] || die "HERDR_WORKSPACE_ID is not set"
+  [[ -n "${HERDR_PANE_ID:-}" ]] || die "HERDR_PANE_ID is not set"
+  [[ -n "$approval_key" ]] || die "approval key cannot be empty"
+
+  require_command herdr
+  require_command jq
+
+  [[ "$#" -eq 0 ]] || die "unexpected arguments"
+
+  local panes=()
+  mapfile -t panes < <(selected_panes \
+    "$HERDR_WORKSPACE_ID" "$requested_pane" "$HERDR_PANE_ID")
+
+  ((${#panes[@]} > 0)) || die "no running Codex panes found in workspace $HERDR_WORKSPACE_ID"
+
+  if ((once)); then
+    local pane_id
+    for pane_id in "${panes[@]}"; do
+      check_pane_once "$pane_id" "$HERDR_WORKSPACE_ID" "$approval_key"
+    done
+    return
+  fi
+
+  local watcher_pids=()
+  local pane_id
+  for pane_id in "${panes[@]}"; do
+    monitor_pane "$pane_id" "$HERDR_WORKSPACE_ID" "$approval_key" &
+    watcher_pids+=("$!")
+  done
+
+  cleanup_all() {
+    local pid
+    for pid in "${watcher_pids[@]}"; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+  }
+  trap cleanup_all EXIT INT TERM
+
+  local watcher_status=0
+  for pane_id in "${watcher_pids[@]}"; do
+    wait "$pane_id" || watcher_status=$?
+  done
+  return "$watcher_status"
+}
+
+main "$@"

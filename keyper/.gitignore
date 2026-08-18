@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.keyper.json
+.env
+.env.*
+!.env.example
+.vercel/
+.convex/

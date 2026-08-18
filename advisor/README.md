@@ -61,7 +61,7 @@ It also pre-seeds model lists for:
 
 - Codex/OpenAI: Codex default, GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna,
   GPT-5.5, GPT-5.4, GPT-5.4 mini
-- Claude: Claude default, Fable 5, Opus 4.8, Sonnet 4.6, Haiku 4.5
+- Claude: Claude default, Fable 5, Opus 5, Opus 4.8, Sonnet 4.6, Haiku 4.5
 
 The wizard shows all configured model options for the selected topic and derives
 the exact command from the base command plus the model attributes. For example,

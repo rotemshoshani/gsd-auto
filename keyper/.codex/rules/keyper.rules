@@ -1,0 +1,55 @@
+# Managed by keyper. Restart Codex after changes.
+
+prefix_rule(
+    pattern = ["vercel", "env", ["pull", "run", "add", "update", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper so environment-variable values cannot enter agent output or command history.",
+)
+
+prefix_rule(
+    pattern = ["npx", "vercel", "env", ["pull", "run", "add", "update", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper so environment-variable values cannot enter agent output or command history.",
+)
+
+prefix_rule(
+    pattern = ["npx", ["-y", "--yes"], "vercel", "env", ["pull", "run", "add", "update", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper so environment-variable values cannot enter agent output or command history.",
+)
+
+prefix_rule(
+    pattern = ["convex", "env", ["get", "list", "set", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper; raw Convex env list and get commands can reveal values.",
+)
+
+prefix_rule(
+    pattern = ["npx", "convex", "env", ["get", "list", "set", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper; raw Convex env list and get commands can reveal values.",
+)
+
+prefix_rule(
+    pattern = ["npx", "--no-install", "convex", "env", ["get", "list", "set", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper; raw Convex env list and get commands can reveal values.",
+)
+
+prefix_rule(
+    pattern = ["npx", ["-y", "--yes"], "convex", "env", ["get", "list", "set", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper; raw Convex env list and get commands can reveal values.",
+)
+
+prefix_rule(
+    pattern = ["bunx", "convex", "env", ["get", "list", "set", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper; raw Convex env list and get commands can reveal values.",
+)
+
+prefix_rule(
+    pattern = ["pnpm", "exec", "convex", "env", ["get", "list", "set", "remove", "rm"]],
+    decision = "forbidden",
+    justification = "Use keyper; raw Convex env list and get commands can reveal values.",
+)

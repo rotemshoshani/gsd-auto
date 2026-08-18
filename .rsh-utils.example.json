@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "dev_env": {
+    "top_command": "npx convex dev",
+    "bottom_command": "npm run dev",
+    "mode": "normal",
+    "repair": false,
+    "remote": "origin",
+    "branch": "dev",
+    "interval_seconds": 30,
+    "restart_hours": 3
+  },
+  "council": {
+    "claude_command": "claude --dangerously-skip-permissions",
+    "codex_command": "codex",
+    "approval_key": "p",
+    "capture_lines": 2000,
+    "claude_ready_pattern": "tab to cycle",
+    "codex_ready_pattern": "Context [0-9]+% left",
+    "ready_timeout_seconds": 180,
+    "claude_chrome_marker": "tab to cycle|Enter to select",
+    "claude_chrome_lines": "7|9",
+    "codex_chrome_marker": "Context [0-9]+% left",
+    "codex_chrome_lines": "5",
+    "paste_settle_seconds": null,
+    "terminal": null
+  }
+}

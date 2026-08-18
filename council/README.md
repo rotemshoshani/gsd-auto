@@ -117,7 +117,7 @@ with a peer in the other pane. If either marker hasn't appeared after
 | `COUNCIL_CLAUDE`               | `claude --dangerously-skip-permissions`       | claude command                               |
 | `COUNCIL_CODEX`                | `codex`                                       | codex command                                |
 | `COUNCIL_APPROVAL_KEY`         | `p`                                           | key sent on codex permission prompt          |
-| `COUNCIL_CAPTURE_LINES`        | `500`                                         | lines of pane history pulled when relaying   |
+| `COUNCIL_CAPTURE_LINES`        | `2000`                                        | lines of pane history pulled when relaying  |
 | `COUNCIL_CLAUDE_READY`         | `tab to cycle`                                | regex that means claude's input box is ready |
 | `COUNCIL_CODEX_READY`          | `Context [0-9]+% left`                        | same, for codex                              |
 | `COUNCIL_READY_TIMEOUT`        | `180`                                         | seconds before the intro paste fires anyway  |
@@ -125,9 +125,20 @@ with a peer in the other pane. If either marker hasn't appeared after
 | `COUNCIL_CLAUDE_CHROME_LINES`  | `7`                                           | lines cut above the anchor (claude)          |
 | `COUNCIL_CODEX_CHROME`         | `Context [0-9]+% left`                        | bottom-chrome anchor for trim (codex)        |
 | `COUNCIL_CODEX_CHROME_LINES`   | `5`                                           | lines cut above the anchor (codex)           |
+| `COUNCIL_PASTE_SETTLE`          | adaptive                                      | fixed seconds to wait after a pasted relay   |
+| `COUNCIL_TERMINAL`              | auto-detected                                  | terminal command for the `B` split action    |
 
 If either TUI changes its footer in a future version, the ready /
 chrome markers are the knobs to retune.
+
+### Project configuration
+
+Copy the parent repository's [`.rsh-utils.example.json`](../.rsh-utils.example.json)
+to `.rsh-utils.json` in the directory where you run `council`. Its optional
+`council` section supports every environment override above, including pane
+chrome settings and `paste_settle_seconds`; `null` preserves the adaptive paste
+settle delay. The file is read only from the current directory. Environment
+variables override the file, and both override built-in defaults.
 
 ### Session naming
 

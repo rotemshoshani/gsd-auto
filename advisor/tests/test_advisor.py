@@ -99,6 +99,25 @@ class AdvisorTests(unittest.TestCase):
         self.assertTrue(any("OpenAI GPT-5.6 Luna" in label for label in labels_seen))
         self.assertEqual([agent.command for agent in agents], ["cdx --model gpt-5.6"])
 
+    def test_model_picker_includes_claude_opus_5(self) -> None:
+        from unittest.mock import patch
+
+        raw = json.loads((Path(__file__).parents[1] / "config.json").read_text())
+        topic_raw = topic_raw_for(raw, "arch")
+        labels_seen: list[str] = []
+
+        def fake_select(prompt: str, options: list[tuple[str, str]], multi: bool = False) -> list[str]:
+            nonlocal labels_seen
+            labels_seen = [label for label, _ in options]
+            opus_5_key = next(key for label, key in options if "Claude Opus 5" in label)
+            return [opus_5_key]
+
+        with patch("advisor.fzf_select", side_effect=fake_select):
+            agents = select_models(raw, topic_raw)
+
+        self.assertTrue(any("Claude Opus 5 (claude-opus-5)" in label for label in labels_seen))
+        self.assertEqual([agent.command for agent in agents], ["cld --model claude-opus-5"])
+
     def test_custom_prompt_puts_task_before_operational_instructions(self) -> None:
         raw = json.loads((Path(__file__).parents[1] / "config.json").read_text())
 

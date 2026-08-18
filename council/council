@@ -20,20 +20,20 @@
 
 set -euo pipefail
 
-CLAUDE_CMD="${COUNCIL_CLAUDE:-claude --dangerously-skip-permissions}"
-CODEX_CMD="${COUNCIL_CODEX:-codex}"
-APPROVAL_KEY="${COUNCIL_APPROVAL_KEY:-p}"
+CLAUDE_CMD="claude --dangerously-skip-permissions"
+CODEX_CMD="codex"
+APPROVAL_KEY="p"
 # Generous capture window so the prior-relay END marker (used to clip
 # already-seen content from the top) stays reachable across longer
 # back-and-forth between relays. tmux history-limit is 200000.
-CAPTURE_LINES="${COUNCIL_CAPTURE_LINES:-2000}"
+CAPTURE_LINES="2000"
 
 # Patterns that indicate each TUI is idle and the input box is accepting
 # keystrokes. The intro paste waits until these match before firing, so a
 # startup modal (update available, login, etc.) won't swallow the message.
-CLAUDE_READY_PATTERN="${COUNCIL_CLAUDE_READY:-tab to cycle}"
-CODEX_READY_PATTERN="${COUNCIL_CODEX_READY:-Context [0-9]+% left}"
-READY_TIMEOUT="${COUNCIL_READY_TIMEOUT:-180}"
+CLAUDE_READY_PATTERN="tab to cycle"
+CODEX_READY_PATTERN="Context [0-9]+% left"
+READY_TIMEOUT="180"
 
 # Bottom-of-pane chrome trim. The TUI's bottom state can be one of a few
 # things (idle input box, selection menu, etc.) and the chrome footprint
@@ -41,10 +41,75 @@ READY_TIMEOUT="${COUNCIL_READY_TIMEOUT:-180}"
 # index. The first matching alternative (scanning the pane bottom-up) wins.
 # For Claude's menu state ("Enter to select · ↑/↓ to navigate") the cut
 # point is refined by scanning upward for the menu box top border.
-CLAUDE_CHROME_MARKER="${COUNCIL_CLAUDE_CHROME:-tab to cycle|Enter to select}"
-CLAUDE_CHROME_LINES="${COUNCIL_CLAUDE_CHROME_LINES:-7|9}"
-CODEX_CHROME_MARKER="${COUNCIL_CODEX_CHROME:-Context [0-9]+% left}"
-CODEX_CHROME_LINES="${COUNCIL_CODEX_CHROME_LINES:-5}"
+CLAUDE_CHROME_MARKER="tab to cycle|Enter to select"
+CLAUDE_CHROME_LINES="7|9"
+CODEX_CHROME_MARKER="Context [0-9]+% left"
+CODEX_CHROME_LINES="5"
+
+load_project_config() {
+  local config_path="$1" config_output key value
+  [[ -f "$config_path" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || {
+    echo "council: python3 is required to read $config_path" >&2
+    return 1
+  }
+  config_output="$(mktemp)"
+  if ! python3 "$2" "$config_path" council >"$config_output"; then
+    rm -f "$config_output"
+    return 1
+  fi
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    case "$key" in
+      claude_command) CLAUDE_CMD="$value" ;;
+      codex_command) CODEX_CMD="$value" ;;
+      approval_key) APPROVAL_KEY="$value" ;;
+      capture_lines) CAPTURE_LINES="$value" ;;
+      claude_ready_pattern) CLAUDE_READY_PATTERN="$value" ;;
+      codex_ready_pattern) CODEX_READY_PATTERN="$value" ;;
+      ready_timeout_seconds) READY_TIMEOUT="$value" ;;
+      claude_chrome_marker) CLAUDE_CHROME_MARKER="$value" ;;
+      claude_chrome_lines) CLAUDE_CHROME_LINES="$value" ;;
+      codex_chrome_marker) CODEX_CHROME_MARKER="$value" ;;
+      codex_chrome_lines) CODEX_CHROME_LINES="$value" ;;
+      paste_settle_seconds) COUNCIL_PASTE_SETTLE="$value" ;;
+      terminal) COUNCIL_TERMINAL="$value" ;;
+    esac
+  done <"$config_output"
+  rm -f "$config_output"
+}
+
+PROJ_DIR="$(pwd)"
+SELF="$(readlink -f "$0")"
+UTILITIES_ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+ORIGINAL_COUNCIL_PASTE_SETTLE_SET=0
+if [[ -v COUNCIL_PASTE_SETTLE ]]; then
+  ORIGINAL_COUNCIL_PASTE_SETTLE_SET=1
+  ORIGINAL_COUNCIL_PASTE_SETTLE="$COUNCIL_PASTE_SETTLE"
+fi
+ORIGINAL_COUNCIL_TERMINAL_SET=0
+if [[ -v COUNCIL_TERMINAL ]]; then
+  ORIGINAL_COUNCIL_TERMINAL_SET=1
+  ORIGINAL_COUNCIL_TERMINAL="$COUNCIL_TERMINAL"
+fi
+load_project_config "$PROJ_DIR/.rsh-utils.json" "$UTILITIES_ROOT/shared/project_config.py"
+
+[[ -v COUNCIL_CLAUDE ]] && CLAUDE_CMD="$COUNCIL_CLAUDE"
+[[ -v COUNCIL_CODEX ]] && CODEX_CMD="$COUNCIL_CODEX"
+[[ -v COUNCIL_APPROVAL_KEY ]] && APPROVAL_KEY="$COUNCIL_APPROVAL_KEY"
+[[ -v COUNCIL_CAPTURE_LINES ]] && CAPTURE_LINES="$COUNCIL_CAPTURE_LINES"
+[[ -v COUNCIL_CLAUDE_READY ]] && CLAUDE_READY_PATTERN="$COUNCIL_CLAUDE_READY"
+[[ -v COUNCIL_CODEX_READY ]] && CODEX_READY_PATTERN="$COUNCIL_CODEX_READY"
+[[ -v COUNCIL_READY_TIMEOUT ]] && READY_TIMEOUT="$COUNCIL_READY_TIMEOUT"
+[[ -v COUNCIL_CLAUDE_CHROME ]] && CLAUDE_CHROME_MARKER="$COUNCIL_CLAUDE_CHROME"
+[[ -v COUNCIL_CLAUDE_CHROME_LINES ]] && CLAUDE_CHROME_LINES="$COUNCIL_CLAUDE_CHROME_LINES"
+[[ -v COUNCIL_CODEX_CHROME ]] && CODEX_CHROME_MARKER="$COUNCIL_CODEX_CHROME"
+[[ -v COUNCIL_CODEX_CHROME_LINES ]] && CODEX_CHROME_LINES="$COUNCIL_CODEX_CHROME_LINES"
+if [[ "$ORIGINAL_COUNCIL_PASTE_SETTLE_SET" == "1" ]]; then
+  COUNCIL_PASTE_SETTLE="$ORIGINAL_COUNCIL_PASTE_SETTLE"
+fi
+if [[ "$ORIGINAL_COUNCIL_TERMINAL_SET" == "1" ]]; then
+  COUNCIL_TERMINAL="$ORIGINAL_COUNCIL_TERMINAL"
+fi
 
 # ---- Shared helpers ---------------------------------------------------------
 # Paste a (potentially large, multi-line) message into a tmux pane and submit.
@@ -556,11 +621,18 @@ Environment overrides:
   COUNCIL_CLAUDE         claude command (default: claude --dangerously-skip-permissions)
   COUNCIL_CODEX          codex  command (default: codex)
   COUNCIL_APPROVAL_KEY   key sent to codex on permission prompt        (default: p)
-  COUNCIL_CAPTURE_LINES  lines captured when relaying a pane           (default: 500)
+  COUNCIL_CAPTURE_LINES  lines captured when relaying a pane           (default: 2000)
   COUNCIL_CLAUDE_READY   extended regex that, once visible in claude's pane,
                          means the input box is ready                  (default: "tab to cycle")
   COUNCIL_CODEX_READY    same, for codex                               (default: "Context [0-9]+% left")
   COUNCIL_READY_TIMEOUT  max seconds to wait for ready before pasting anyway (default: 180)
+  COUNCIL_CLAUDE_CHROME, COUNCIL_CLAUDE_CHROME_LINES,
+  COUNCIL_CODEX_CHROME, COUNCIL_CODEX_CHROME_LINES
+                         pane-chrome trim controls
+  COUNCIL_PASTE_SETTLE   fixed seconds to wait after a pasted relay
+  COUNCIL_TERMINAL       terminal command used by the [B] split action
+
+Project config: .rsh-utils.json in the current directory. CLI > environment > config > defaults.
 
 Re-running in a directory with an existing session attaches to it.
 EOF
@@ -575,8 +647,6 @@ done
 
 command -v tmux >/dev/null 2>&1 || { echo "council: tmux not installed" >&2; exit 1; }
 
-PROJ_DIR="$(pwd)"
-SELF="$(readlink -f "$0")"
 SESSION="council-$(basename "$PROJ_DIR" | tr -c '[:alnum:]_-' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then

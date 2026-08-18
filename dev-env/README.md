@@ -141,6 +141,22 @@ Or via environment variables:
 DEV_ENV_TOP="pnpm api:dev" DEV_ENV_BOTTOM="pnpm web:dev" dev-env
 ```
 
+### Project configuration
+
+Copy the parent repository's [`.rsh-utils.example.json`](../.rsh-utils.example.json)
+to `.rsh-utils.json` in the directory where you run `dev-env`. Its optional
+`dev_env` section can set the commands, `mode` (`normal`, `pull`, or `sync`),
+repair behavior, remote/branch, interval, and restart hours. Use
+`"restart_hours": null` to disable scheduled restarts.
+
+The file is read only from the current directory. CLI options override
+environment variables, which override the file. In addition to `DEV_ENV_TOP`
+and `DEV_ENV_BOTTOM`, the equivalent environment overrides are `DEV_ENV_MODE`,
+`DEV_ENV_REPAIR` (`true`/`false` or `1`/`0`), `DEV_ENV_PULL_REMOTE`,
+`DEV_ENV_PULL_BRANCH`, `DEV_ENV_PULL_INTERVAL`, and `DEV_ENV_RESTART_HOURS`
+(`off` disables restarts). `--no-pull`, `--no-sync`, and `--no-repair` disable
+the corresponding project-config defaults for one launch.
+
 Re-running `dev-env` in a directory that already has a session kills that
 session and creates a fresh one. Before launch it also stops known dev-server
 processes (`npm run dev`, `next dev` / `next-server`, `npx convex dev`) whose

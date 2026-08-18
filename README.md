@@ -2,6 +2,18 @@
 
 A grab bag of small personal tools — terminal launchers, timers, and automation around Claude Code / GSD workflows.
 
+## Project-local launcher config
+
+`dev-env` and `council` can read [`.rsh-utils.example.json`](.rsh-utils.example.json)
+as a project-local configuration template. Copy it to `.rsh-utils.json` in the
+directory where you launch a tool, then keep only the fields you need. The file
+is not searched in parent directories or Git roots: the launch directory is the
+scope. Command-line options override environment variables, which override the
+project config, which overrides built-in defaults.
+
+The example is the canonical schema and is validated in tests. Update it with
+every supported config change. Do not place secrets in `.rsh-utils.json`.
+
 ## Projects
 
 ### [arch-advisor](arch-advisor/)
@@ -10,8 +22,8 @@ Autonomous tmux runner for repeated AI architecture and performance review passe
 ### [cc-commands](cc-commands/)
 Source of truth for custom Claude Code slash commands (`/0-done`, `/0-sync`, `/0-teach`, etc.). Files here get copied into `~/.claude/commands/` via the sync command.
 
-### [codex-auto](codex-auto/)
-Bash watcher that auto-approves OpenAI Codex CLI permission prompts inside a tmux pane, with a configurable blacklist for destructive commands (`rm`, `sudo`, `git push --force`, …). Used by `council` to keep the Codex pane unattended.
+### [herdr-codex-auto](herdr-codex-auto/)
+Event-driven Herdr watcher that presses `p` for Codex command-permission prompts while leaving ordinary questions untouched. It only watches existing Codex panes in the current workspace when explicitly launched. The older tmux implementation remains under `archive/codex-auto/`.
 
 ### [council](council/)
 A tmux launcher for brainstorming with two AI CLIs side-by-side — Claude Code on the left, Codex on the right — with a controller bar that relays one model's last reply to the other on a single keypress.
