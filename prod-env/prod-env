@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Config-driven tmux dashboard for production monitors."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parent.parent
+sys.path.insert(0, str(ROOT / "shared"))
+
+from project_config import ConfigError, load_config, prod_env_values  # noqa: E402
+
+
+RESET = "\033[0m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+CLEAR = "\033[2J\033[H"
+
+
+def color(value: str, code: str) -> str:
+    return f"{code}{value}{RESET}"
+
+
+def load_prod_env(project_dir: Path) -> dict[str, Any]:
+    path = project_dir / ".rsh-utils.json"
+    if not path.is_file():
+        raise ConfigError(f"missing {path}; add a prod_env section to the project config")
+    return prod_env_values(load_config(path))
+
+
+def display_timestamp(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "unknown time"
+    seconds = value / 1000 if value > 10_000_000_000 else value
+    return datetime.fromtimestamp(seconds).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def event_prefix(event: dict[str, Any], timestamp: Any | None = None) -> str:
+    udf_type = str(event.get("udfType", "?"))
+    source = udf_type[:1].upper() if udf_type else "?"
+    identifier = str(event.get("identifier", "unknown"))
+    return f"{display_timestamp(event.get('timestamp') if timestamp is None else timestamp)} [CONVEX {source}({identifier})]"
+
+
+def log_line_parts(line: Any) -> tuple[str, str, Any | None]:
+    if isinstance(line, dict):
+        level = str(line.get("level", "LOG")).upper()
+        messages = line.get("messages", [])
+        if isinstance(messages, list):
+            message = " ".join(str(item) for item in messages)
+        else:
+            message = str(messages)
+        if line.get("isTruncated"):
+            message += " (truncated due to length)"
+        return level, message, line.get("timestamp")
+    text = str(line)
+    match = re.match(r"^\[([^]]+)]\s*(.*)$", text)
+    return (match.group(1).upper(), match.group(2), None) if match else ("LOG", text, None)
+
+
+def format_convex_event(event: dict[str, Any], mode: str) -> list[str]:
+    lines: list[str] = []
+    log_lines = event.get("logLines", [])
+    if not isinstance(log_lines, list):
+        log_lines = []
+
+    for raw_line in log_lines:
+        level, message, timestamp = log_line_parts(raw_line)
+        if mode == "errors" and level != "ERROR":
+            continue
+        rendered = f"{event_prefix(event, timestamp)} [{level}] {message}"
+        if level == "ERROR":
+            lines.append(color(rendered, RED))
+        elif level == "WARN":
+            lines.append(color(rendered, YELLOW))
+        elif level == "DEBUG":
+            lines.append(color(rendered, DIM))
+        else:
+            lines.append(f"{color(event_prefix(event, timestamp), CYAN)} [{level}] {message}")
+
+    error = event.get("error")
+    if error is not None:
+        if isinstance(error, (dict, list)):
+            error = json.dumps(error, ensure_ascii=False, separators=(",", ":"))
+        lines.append(color(f"{event_prefix(event)} {error}", RED))
+    elif mode == "all" and event.get("kind") == "Completion":
+        duration = event.get("executionTime")
+        suffix = "Function completed"
+        if isinstance(duration, (int, float)):
+            suffix += f" in {round(duration * 1000)} ms"
+        lines.append(color(f"{event_prefix(event)} {suffix}", GREEN))
+    return lines
+
+
+def run_convex(pane: dict[str, Any]) -> int:
+    command = [
+        "npx", "convex", "logs", "--deployment", pane["deployment"],
+        "--history", str(pane["history"]), "--jsonl",
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for raw in process.stdout:
+        line = raw.rstrip("\r\n")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            if line:
+                print(color(line, DIM), flush=True)
+            continue
+        if not isinstance(event, dict):
+            continue
+        for rendered in format_convex_event(event, pane["log_mode"]):
+            print(rendered, flush=True)
+    return process.wait()
+
+
+def extract_json(raw: str) -> dict[str, Any]:
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("Vercel CLI did not return JSON")
+    parsed = json.loads(raw[start : end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Vercel CLI returned an unexpected JSON value")
+    return parsed
+
+
+def state_color(state: str) -> str:
+    if state == "ERROR":
+        return RED
+    if state == "READY":
+        return GREEN
+    if state in {"QUEUED", "INITIALIZING", "BUILDING", "DEPLOYING"}:
+        return YELLOW
+    return DIM
+
+
+def deployment_label(deployment: dict[str, Any]) -> str:
+    meta = deployment.get("meta") if isinstance(deployment.get("meta"), dict) else {}
+    ref = meta.get("githubCommitRef") or meta.get("gitCommitRef") or "unknown-ref"
+    sha = meta.get("githubCommitSha") or meta.get("gitCommitSha") or "unknown-sha"
+    message = meta.get("githubCommitMessage") or meta.get("gitCommitMessage") or "unknown commit"
+    return f"{ref} {str(sha)[:7]} - {message}"
+
+
+def render_deployment(deployment: dict[str, Any]) -> list[str]:
+    state = str(deployment.get("state", "UNKNOWN"))
+    created = display_timestamp(deployment.get("createdAt"))
+    url = deployment.get("url")
+    rendered = [color(f"{state} at {created}", state_color(state)), f"  {deployment_label(deployment)}"]
+    if isinstance(url, str) and url:
+        rendered.append(f"  https://{url}")
+    return rendered
+
+
+def format_vercel_status(parsed: dict[str, Any], target: str) -> tuple[list[str], str]:
+    raw_deployments = parsed.get("deployments", [])
+    deployments = [item for item in raw_deployments if isinstance(item, dict)] if isinstance(raw_deployments, list) else []
+    if target == "preview":
+        deployments = [item for item in deployments if item.get("target") in {None, "preview"}]
+    elif target != "all":
+        deployments = [item for item in deployments if item.get("target") == target]
+    active_states = {"QUEUED", "INITIALIZING", "BUILDING", "DEPLOYING"}
+    latest = deployments[0] if deployments else None
+    last_ready = next((item for item in deployments if item.get("state") == "READY"), None)
+    active = [item for item in deployments if item.get("state") in active_states]
+    lines = [f"Vercel deployments ({target})", f"Checked: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}"]
+    context = parsed.get("contextName")
+    if isinstance(context, str) and context:
+        lines.append(f"Scope: {context}")
+    lines.append("")
+    lines.append("Last successful deployment:")
+    lines.extend(render_deployment(last_ready) if last_ready else ["  none in recent deployments"])
+    lines.extend(["", "Latest deployment:"])
+    lines.extend(render_deployment(latest) if latest else ["  none found"])
+    lines.extend(["", "Active deployments:"])
+    if active:
+        for item in active:
+            lines.extend(render_deployment(item))
+    else:
+        lines.append("  none")
+    error_url = str(latest.get("url", "")) if latest and latest.get("state") == "ERROR" else ""
+    return lines, error_url
+
+
+def vercel_list_command(pane: dict[str, Any]) -> list[str]:
+    command = ["vercel", "list", pane["project"], "--format", "json", "--yes", "--no-color"]
+    if pane.get("scope"):
+        command.extend(["--scope", pane["scope"]])
+    return command
+
+
+def run_vercel(pane: dict[str, Any]) -> int:
+    last_error_url = ""
+    error_log_lines: list[str] = []
+    while True:
+        result = subprocess.run(vercel_list_command(pane), capture_output=True, text=True, check=False)
+        print(CLEAR, end="")
+        if result.returncode != 0:
+            print(color(f"Vercel list failed with exit code {result.returncode}", RED), flush=True)
+            time.sleep(pane["poll_seconds"])
+            continue
+        try:
+            lines, error_url = format_vercel_status(extract_json(result.stdout), pane["target"])
+        except (json.JSONDecodeError, ValueError) as error:
+            print(color(f"Could not parse Vercel status: {error}", RED), flush=True)
+            time.sleep(pane["poll_seconds"])
+            continue
+        print("\n".join(lines))
+        if error_url:
+            if error_url != last_error_url:
+                inspect = subprocess.run(
+                    ["vercel", "inspect", error_url, "--logs", "--no-color"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                combined = (inspect.stdout + inspect.stderr).splitlines()
+                error_log_lines = combined[-pane["error_log_lines"] :]
+                last_error_url = error_url
+            print("\n" + color("Latest deployment failed; build-log tail:", RED))
+            print("\n".join(error_log_lines))
+        else:
+            last_error_url = ""
+            error_log_lines = []
+        sys.stdout.flush()
+        time.sleep(pane["poll_seconds"])
+
+
+def run_pane(project_dir: Path, index: int) -> int:
+    panes = load_prod_env(project_dir)["panes"]
+    if not 0 <= index < len(panes):
+        raise ConfigError(f"pane index {index} is not configured")
+    pane = panes[index]
+    print(CLEAR, end="")
+    print(color(pane["title"], CYAN))
+    print()
+    if pane["type"] == "convex":
+        return_code = run_convex(pane)
+    elif pane["type"] == "vercel":
+        return_code = run_vercel(pane)
+    else:
+        return_code = subprocess.run(["/bin/bash", "-lc", pane["command"]], check=False).returncode
+    print()
+    print(color(f"Monitor exited with code {return_code}. Press its number to restart it.", RED))
+    while True:
+        signal.pause()
+
+
+def tmux(socket: str, *args: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", "-L", socket, *args],
+        text=True,
+        capture_output=capture,
+        check=False,
+    )
+
+
+def pane_command(project_dir: Path, index: int) -> str:
+    return shlex.join([str(SCRIPT), "__pane", str(project_dir), str(index)])
+
+
+def restart_all(socket: str, session: str) -> int:
+    result = tmux(socket, "list-panes", "-t", session, "-F", "#{pane_id}", capture=True)
+    if result.returncode != 0:
+        return result.returncode
+    for pane_id in result.stdout.splitlines():
+        if pane_id:
+            tmux(socket, "respawn-pane", "-k", "-t", pane_id)
+    return 0
+
+
+def launch(project_dir: Path) -> int:
+    config = load_prod_env(project_dir)
+    panes = config["panes"]
+    for command in ("tmux", "python3"):
+        if shutil.which(command) is None:
+            raise ConfigError(f"{command} is required")
+    required = {"convex": "npx", "vercel": "vercel"}
+    for pane in panes:
+        binary = required.get(pane["type"])
+        if binary and shutil.which(binary) is None:
+            raise ConfigError(f"{binary} is required for the {pane['title']} pane")
+
+    digest = hashlib.sha256(str(project_dir).encode()).hexdigest()[:8]
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", project_dir.name).strip("_") or "project"
+    socket = f"prod-env-{safe_name}-{digest}"
+    session = "monitors"
+    tmux(socket, "kill-server", capture=True)
+
+    terminal_size = shutil.get_terminal_size((200, 50))
+    first = tmux(
+        socket,
+        "new-session", "-d", "-s", session, "-n", "prod", "-c", str(project_dir),
+        "-x", str(terminal_size.columns), "-y", str(terminal_size.lines),
+        "-P", "-F", "#{pane_id}", pane_command(project_dir, 0), capture=True,
+    )
+    if first.returncode != 0:
+        raise ConfigError("tmux could not create the prod-env session")
+    pane_ids = [first.stdout.strip()]
+    tmux(socket, "set-window-option", "-t", session, "remain-on-exit", "on")
+    tmux(socket, "set-window-option", "-t", session, "pane-border-status", "top")
+    tmux(socket, "set-window-option", "-t", session, "pane-border-format", " #[fg=cyan,bold]#{pane_title} #[default]")
+
+    for index in range(1, len(panes)):
+        split = tmux(
+            socket, "split-window", "-t", pane_ids[0], "-v", "-c", str(project_dir),
+            "-P", "-F", "#{pane_id}", pane_command(project_dir, index), capture=True,
+        )
+        if split.returncode != 0:
+            tmux(socket, "kill-server")
+            raise ConfigError(f"tmux could not create pane {index + 1}")
+        pane_ids.append(split.stdout.strip())
+        tmux(socket, "select-layout", "-t", session, "even-vertical" if len(pane_ids) == 2 else "tiled")
+
+    for index, (pane, pane_id) in enumerate(zip(panes, pane_ids), start=1):
+        tmux(socket, "select-pane", "-t", pane_id, "-T", pane["title"])
+        tmux(socket, "bind-key", "-n", str(index), "respawn-pane", "-k", "-t", pane_id)
+
+    restart_command = shlex.join([str(SCRIPT), "__restart_all", socket, session])
+    tmux(socket, "bind-key", "-n", "A", "run-shell", restart_command)
+    tmux(socket, "bind-key", "-n", "Q", "kill-server")
+    tmux(socket, "set-option", "-t", session, "status", "on")
+    tmux(socket, "set-option", "-t", session, "status-position", "top")
+    tmux(socket, "set-option", "-t", session, "status-left-length", "500")
+    tmux(socket, "set-option", "-t", session, "status-right", "")
+    controls = "  ".join(f"[{index}] {pane['title']}" for index, pane in enumerate(panes, start=1))
+    controls += "  [A] restart all  [Q] quit"
+    tmux(socket, "set-option", "-t", session, "status-left", f"#[fg=cyan,bold] prod-env #[default] {controls}")
+    tmux(socket, "select-pane", "-t", pane_ids[0])
+
+    environment = os.environ.copy()
+    environment.pop("TMUX", None)
+    os.execvpe("tmux", ["tmux", "-L", socket, "attach-session", "-t", session], environment)
+    return 0
+
+
+def usage() -> None:
+    print("""Usage: prod-env
+
+Launch the production monitors configured by prod_env.panes in the current
+directory's .rsh-utils.json. Press 1-9 to restart a pane, A to restart all,
+or Q to quit.
+""")
+
+
+def main() -> int:
+    try:
+        if len(sys.argv) >= 2 and sys.argv[1] == "__pane":
+            return run_pane(Path(sys.argv[2]).resolve(), int(sys.argv[3]))
+        if len(sys.argv) >= 2 and sys.argv[1] == "__restart_all":
+            return restart_all(sys.argv[2], sys.argv[3])
+        if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+            usage()
+            return 0
+        if len(sys.argv) != 1:
+            usage()
+            return 2
+        return launch(Path.cwd().resolve())
+    except (ConfigError, json.JSONDecodeError, OSError, ValueError) as error:
+        print(f"prod-env: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

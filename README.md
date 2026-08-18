@@ -4,12 +4,13 @@ A grab bag of small personal tools — terminal launchers, timers, and automatio
 
 ## Project-local launcher config
 
-`dev-env` and `council` can read [`.rsh-utils.example.json`](.rsh-utils.example.json)
+`dev-env`, `council`, and `prod-env` can read [`.rsh-utils.example.json`](.rsh-utils.example.json)
 as a project-local configuration template. Copy it to `.rsh-utils.json` in the
 directory where you launch a tool, then keep only the fields you need. The file
 is not searched in parent directories or Git roots: the launch directory is the
-scope. Command-line options override environment variables, which override the
-project config, which overrides built-in defaults.
+scope. For `dev-env` and `council`, command-line options override environment
+variables, which override project config and built-in defaults. `prod-env` gets
+its monitor list directly from project config.
 
 The example is the canonical schema and is validated in tests. Update it with
 every supported config change. Do not place secrets in `.rsh-utils.json`.
@@ -45,6 +46,9 @@ Terminal Pomodoro timer (`pomopp`) that splits work into smaller chunks — `--w
 
 ### [prompt-queue](prompt-queue/)
 Tmux controller for feeding Codex a queue of prompts one at a time. Each prompt gets a fresh Codex process, a 45-minute run window, a captured worker pane, and then a clean worker restart before the next prompt.
+
+### [prod-env](prod-env/)
+Config-driven tmux dashboard for production monitors. It has structured Convex error filtering, Vercel deployment status and failed-build logs, arbitrary command panes, and automatic layouts for one to nine monitors.
 
 ### [statusline](statusline/)
 Custom Claude Code statusline (Node script) showing model, current task or GSD phase state, working directory, and context usage. `install.sh` wires it into Claude Code's settings.

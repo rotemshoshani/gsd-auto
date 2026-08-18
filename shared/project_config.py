@@ -104,21 +104,94 @@ def council_values(raw: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def prod_env_values(raw: dict[str, Any]) -> dict[str, Any]:
+    data = validate_section(raw, "prod_env", {"panes"})
+    if "panes" not in data:
+        fail("prod_env.panes is required")
+    panes = data["panes"]
+    if not isinstance(panes, list):
+        fail("prod_env.panes must be an array")
+    if not 1 <= len(panes) <= 9:
+        fail("prod_env.panes must contain between 1 and 9 panes")
+
+    normalized: list[dict[str, Any]] = []
+    titles: set[str] = set()
+    common_fields = {"type", "title"}
+    type_fields = {
+        "convex": {"deployment", "log_mode", "history"},
+        "vercel": {"project", "target", "scope", "poll_seconds", "error_log_lines"},
+        "command": {"command"},
+    }
+
+    for index, value in enumerate(panes):
+        name = f"prod_env.panes[{index}]"
+        pane = object_value(value, name)
+        pane_type = string(pane.get("type"), f"{name}.type")
+        if pane_type not in type_fields:
+            fail(f"{name}.type must be one of: command, convex, vercel")
+        unknown = sorted(set(pane) - common_fields - type_fields[pane_type])
+        if unknown:
+            fail(f"{name} has unsupported field(s): {', '.join(unknown)}")
+
+        title = string(pane.get("title"), f"{name}.title")
+        if title in titles:
+            fail(f"prod_env pane titles must be unique: {title}")
+        titles.add(title)
+
+        result: dict[str, Any] = {"type": pane_type, "title": title}
+        if pane_type == "convex":
+            result["deployment"] = string(pane.get("deployment"), f"{name}.deployment")
+            log_mode = pane.get("log_mode", "errors")
+            if log_mode not in {"errors", "all"}:
+                fail(f"{name}.log_mode must be one of: all, errors")
+            result["log_mode"] = log_mode
+            result["history"] = integer(pane.get("history", 500), f"{name}.history", 0)
+        elif pane_type == "vercel":
+            result["project"] = string(pane.get("project"), f"{name}.project")
+            target = pane.get("target", "production")
+            if target not in {"production", "preview", "all"}:
+                fail(f"{name}.target must be one of: all, preview, production")
+            result["target"] = target
+            if "scope" in pane:
+                result["scope"] = string(pane["scope"], f"{name}.scope")
+            result["poll_seconds"] = integer(
+                pane.get("poll_seconds", 30), f"{name}.poll_seconds", 1
+            )
+            result["error_log_lines"] = integer(
+                pane.get("error_log_lines", 120), f"{name}.error_log_lines", 1
+            )
+        else:
+            result["command"] = string(pane.get("command"), f"{name}.command")
+        normalized.append(result)
+
+    return {"panes": normalized}
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as config_file:
+        raw = json.load(config_file)
+    raw = object_value(raw, "root")
+    unknown = sorted(set(raw) - {"version", "dev_env", "council", "prod_env"})
+    if unknown:
+        fail(f"root has unsupported field(s): {', '.join(unknown)}")
+    if raw.get("version") != 1:
+        fail("version must be 1")
+    return raw
+
+
 def main() -> int:
-    if len(sys.argv) != 3 or sys.argv[2] not in {"dev_env", "council"}:
-        print("usage: project_config.py PATH {dev_env|council}", file=sys.stderr)
+    if len(sys.argv) != 3 or sys.argv[2] not in {"dev_env", "council", "prod_env"}:
+        print("usage: project_config.py PATH {dev_env|council|prod_env}", file=sys.stderr)
         return 2
     path = Path(sys.argv[1])
     try:
-        with path.open(encoding="utf-8") as config_file:
-            raw = json.load(config_file)
-        raw = object_value(raw, "root")
-        unknown = sorted(set(raw) - {"version", "dev_env", "council"})
-        if unknown:
-            fail(f"root has unsupported field(s): {', '.join(unknown)}")
-        if raw.get("version") != 1:
-            fail("version must be 1")
-        values = dev_env_values(raw) if sys.argv[2] == "dev_env" else council_values(raw)
+        raw = load_config(path)
+        if sys.argv[2] == "dev_env":
+            values = dev_env_values(raw)
+        elif sys.argv[2] == "council":
+            values = council_values(raw)
+        else:
+            values = {"json": json.dumps(prod_env_values(raw), separators=(",", ":"))}
     except (OSError, json.JSONDecodeError, ConfigError) as error:
         print(f"rsh-utils config error in {path}: {error}", file=sys.stderr)
         return 1

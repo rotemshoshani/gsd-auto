@@ -24,5 +24,29 @@
     "codex_chrome_lines": "5",
     "paste_settle_seconds": null,
     "terminal": null
+  },
+  "prod_env": {
+    "panes": [
+      {
+        "type": "convex",
+        "title": "Convex errors",
+        "deployment": "prod",
+        "log_mode": "errors",
+        "history": 500
+      },
+      {
+        "type": "vercel",
+        "title": "Vercel production",
+        "project": "my-project",
+        "target": "production",
+        "poll_seconds": 30,
+        "error_log_lines": 120
+      },
+      {
+        "type": "command",
+        "title": "Worker logs",
+        "command": "my-worker logs --errors"
+      }
+    ]
   }
 }
