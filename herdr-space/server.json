@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "label": "server",
+  "cwd": "~/projects/meniv/crm",
+  "tabs": [
+    {
+      "label": "meniv-prod",
+      "cwd": "~/projects/meniv/crm",
+      "command": "prod-env"
+    },
+    {
+      "label": "meniv-dev",
+      "cwd": "~/projects/meniv/crm",
+      "command": "dev-env"
+    },
+    {
+      "label": "newsletter",
+      "cwd": "~/projects/misc/daily-newsletter/scripts",
+      "command": "bash newsletter-loop.sh"
+    }
+  ]
+}

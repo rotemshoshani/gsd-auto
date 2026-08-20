@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""fzf picker over Herdr workspace presets, and the launcher that opens one."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT = Path(__file__).resolve()
+PRESET_DIR = SCRIPT.parent
+
+
+class ConfigError(Exception):
+    """A preset file is missing, unreadable, or does not match the schema."""
+
+
+@dataclass(frozen=True)
+class Tab:
+    label: str
+    cwd: str
+    command: str
+
+
+@dataclass(frozen=True)
+class Preset:
+    name: str
+    label: str
+    tabs: tuple[Tab, ...]
+    path: Path
+
+
+def _expand(value: str) -> str:
+    return str(Path(os.path.expandvars(value)).expanduser())
+
+
+def _require_text(value: Any, field: str, where: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}: '{field}' must be a non-empty string")
+    return value.strip()
+
+
+def load_preset(path: Path) -> Preset:
+    """Parse and validate one preset file."""
+    where = path.name
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{where}: invalid JSON ({exc.msg} at line {exc.lineno})") from exc
+    except OSError as exc:
+        raise ConfigError(f"{where}: cannot read file ({exc.strerror})") from exc
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: top level must be a JSON object")
+
+    version = raw.get("version", 1)
+    if version != 1:
+        raise ConfigError(f"{where}: unsupported version {version!r}, expected 1")
+
+    label = _require_text(raw.get("label"), "label", where)
+    default_cwd = raw.get("cwd", "~")
+    if not isinstance(default_cwd, str):
+        raise ConfigError(f"{where}: 'cwd' must be a string")
+
+    raw_tabs = raw.get("tabs")
+    if not isinstance(raw_tabs, list) or not raw_tabs:
+        raise ConfigError(f"{where}: 'tabs' must be a non-empty list")
+
+    tabs: list[Tab] = []
+    seen: set[str] = set()
+    for index, raw_tab in enumerate(raw_tabs, start=1):
+        spot = f"{where}: tab {index}"
+        if not isinstance(raw_tab, dict):
+            raise ConfigError(f"{spot} must be a JSON object")
+        tab_label = _require_text(raw_tab.get("label"), "label", spot)
+        if tab_label in seen:
+            raise ConfigError(f"{where}: duplicate tab label {tab_label!r}")
+        seen.add(tab_label)
+
+        cwd = raw_tab.get("cwd", default_cwd)
+        if not isinstance(cwd, str):
+            raise ConfigError(f"{spot}: 'cwd' must be a string")
+        command = raw_tab.get("command", "")
+        if not isinstance(command, str):
+            raise ConfigError(f"{spot}: 'command' must be a string")
+
+        tabs.append(Tab(label=tab_label, cwd=_expand(cwd), command=command.strip()))
+
+    return Preset(name=path.stem, label=label, tabs=tuple(tabs), path=path)
+
+
+def discover_presets(directory: Path) -> list[Preset]:
+    """Load every `*.json` preset sitting beside the script, sorted by filename."""
+    return [load_preset(path) for path in sorted(directory.glob("*.json"))]
+
+
+def missing_directories(preset: Preset) -> list[tuple[str, str]]:
+    """Return (tab label, cwd) for every tab whose working directory is absent."""
+    return [(tab.label, tab.cwd) for tab in preset.tabs if not Path(tab.cwd).is_dir()]
+
+
+class HerdrError(Exception):
+    """The herdr CLI refused a command or answered with something unparseable."""
+
+
+class HerdrCLI:
+    """Thin wrapper over the `herdr` binary that hands back the `result` object."""
+
+    def __init__(self, runner=subprocess.run, binary: str = "herdr") -> None:
+        self._runner = runner
+        self._binary = binary
+
+    def __call__(self, *args: str) -> dict[str, Any]:
+        argv = [self._binary, *args]
+        completed = self._runner(argv, capture_output=True, text=True)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise HerdrError(f"{' '.join(argv)} failed: {detail or 'no output'}")
+        if not completed.stdout.strip():
+            return {}  # `pane run` and friends succeed silently
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise HerdrError(f"{' '.join(argv)} returned unparseable output: {exc.msg}") from exc
+        return payload.get("result", {})
+
+
+def workspace_id_for_label(cli: HerdrCLI, label: str) -> str | None:
+    """The id of the open workspace carrying this exact label, if there is one."""
+    for workspace in cli("workspace", "list").get("workspaces", []):
+        if workspace.get("label") == label:
+            return workspace.get("workspace_id")
+    return None
+
+
+SETTLE_SECONDS = 0.4
+
+
+@dataclass(frozen=True)
+class LaunchResult:
+    action: str  # "created" or "focused"
+    workspace_id: str
+    preset: Preset
+
+
+def launch_preset(cli: HerdrCLI, preset: Preset, settle=None) -> LaunchResult:
+    """Open the preset's workspace, or focus it when it is already running."""
+    if settle is None:
+        def settle() -> None:
+            time.sleep(SETTLE_SECONDS)
+
+    existing = workspace_id_for_label(cli, preset.label)
+    if existing:
+        cli("workspace", "focus", existing)
+        return LaunchResult(action="focused", workspace_id=existing, preset=preset)
+
+    first, rest = preset.tabs[0], preset.tabs[1:]
+    created = cli(
+        "workspace", "create", "--cwd", first.cwd, "--label", preset.label, "--no-focus"
+    )
+    workspace_id = created["workspace"]["workspace_id"]
+
+    cli("tab", "rename", created["tab"]["tab_id"], first.label)
+    _run_command(cli, created["root_pane"]["pane_id"], first.command, settle)
+
+    for tab in rest:
+        opened = cli(
+            "tab", "create", "--workspace", workspace_id, "--cwd", tab.cwd,
+            "--label", tab.label, "--no-focus",
+        )
+        _run_command(cli, opened["root_pane"]["pane_id"], tab.command, settle)
+
+    cli("workspace", "focus", workspace_id)
+    return LaunchResult(action="created", workspace_id=workspace_id, preset=preset)
+
+
+def _run_command(cli: HerdrCLI, pane_id: str, command: str, settle) -> None:
+    """Type a command into a freshly created pane once its shell has a prompt."""
+    if not command:
+        return
+    settle()
+    cli("pane", "run", pane_id, command)
+
+
+def describe_preset(preset: Preset) -> str:
+    """The preview text fzf shows beside the highlighted preset."""
+    home = str(Path.home())
+    lines = [f"workspace: {preset.label}", ""]
+    for index, tab in enumerate(preset.tabs, start=1):
+        cwd = tab.cwd.replace(home, "~", 1) if tab.cwd.startswith(home) else tab.cwd
+        lines.append(f"{index}. {tab.label}")
+        lines.append(f"   cwd: {cwd}")
+        lines.append(f"   run: {tab.command or '(plain shell)'}")
+    return "\n".join(lines)
+
+
+def select_preset(presets: list[Preset], runner=subprocess.run) -> Preset | None:
+    """Show the fzf picker; return the chosen preset, or None if it was cancelled."""
+    by_name = {preset.name: preset for preset in presets}
+    argv = [
+        "fzf",
+        "--prompt=herdr space > ",
+        "--height=~60%",
+        "--reverse",
+        "--preview", f"{shlex.quote(str(SCRIPT))} --describe {{}}",
+        "--preview-window=right:60%",
+    ]
+    completed = runner(argv, input="\n".join(by_name), capture_output=True, text=True)
+    if completed.returncode != 0:
+        return None
+    return by_name.get(completed.stdout.strip())
+
+
+def require_binaries(names: list[str], which=shutil.which) -> list[str]:
+    """The subset of these binaries that is not on PATH."""
+    return [name for name in names if which(name) is None]
+
+
+USAGE = """usage: herdr-space [PRESET | --list | --describe PRESET]
+
+Presets are the *.json files sitting next to this script. With no argument
+an fzf picker opens; naming a preset launches it directly. A workspace that
+is already open is focused rather than opened a second time."""
+
+
+def main(argv=None, preset_dir: Path = PRESET_DIR, cli: HerdrCLI | None = None,
+         picker=None, settle=None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+
+    if args and args[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
+
+    try:
+        presets = discover_presets(preset_dir)
+    except ConfigError as exc:
+        print(f"herdr-space: {exc}", file=sys.stderr)
+        return 1
+
+    if not presets:
+        print(f"herdr-space: no presets in {preset_dir}", file=sys.stderr)
+        return 1
+
+    by_name = {preset.name: preset for preset in presets}
+
+    if args and args[0] == "--list":
+        for name in by_name:
+            print(name)
+        return 0
+
+    if args and args[0] == "--describe":
+        if len(args) < 2 or args[1] not in by_name:
+            print(f"herdr-space: unknown preset {args[1:2] or ['(none)']}", file=sys.stderr)
+            return 2
+        print(describe_preset(by_name[args[1]]))
+        return 0
+
+    if args:
+        preset = by_name.get(args[0])
+        if preset is None:
+            available = ", ".join(by_name)
+            print(f"herdr-space: unknown preset '{args[0]}' (have: {available})", file=sys.stderr)
+            return 2
+    else:
+        preset = (picker or select_preset)(presets)
+        if preset is None:
+            return 130
+
+    missing = missing_directories(preset)
+    if missing:
+        for label, cwd in missing:
+            print(f"herdr-space: {preset.name}: tab '{label}' cwd does not exist: {cwd}",
+                  file=sys.stderr)
+        return 1
+
+    cli = cli or HerdrCLI()
+    try:
+        result = launch_preset(cli, preset, settle=settle)
+    except HerdrError as exc:
+        print(f"herdr-space: {exc}", file=sys.stderr)
+        return 1
+
+    if result.action == "focused":
+        print(f"{preset.label} is already open ({result.workspace_id}) — focused it")
+    else:
+        tabs = ", ".join(tab.label for tab in preset.tabs)
+        print(f"opened {preset.label} ({result.workspace_id}): {tabs}")
+    return 0
+
+
+if __name__ == "__main__":
+    absent = require_binaries(["herdr", "fzf"])
+    if absent:
+        print(f"herdr-space: not on PATH: {', '.join(absent)}", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(main())

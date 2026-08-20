@@ -26,6 +26,9 @@ Source of truth for custom Claude Code slash commands (`/0-done`, `/0-sync`, `/0
 ### [herdr-codex-auto](herdr-codex-auto/)
 Event-driven Herdr watcher that presses `p` for Codex command-permission prompts while leaving ordinary questions untouched. It only watches existing Codex panes in the current workspace when explicitly launched. The older tmux implementation remains under `archive/codex-auto/`.
 
+### [herdr-space](herdr-space/)
+fzf picker over Herdr workspace presets. Each `*.json` beside the script defines a workspace label and its tabs; picking one opens the workspace and starts each tab's command, or focuses the workspace when it is already running.
+
 ### [council](council/)
 A tmux launcher for brainstorming with two AI CLIs side-by-side — Claude Code on the left, Codex on the right — with a controller bar that relays one model's last reply to the other on a single keypress.
 
