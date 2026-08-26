@@ -50,11 +50,11 @@ Windows Terminal / PowerShell. Use WSL + the bash script.
 ## Setup
 
 ```bash
-# Clone the parent repo somewhere, e.g. ~/projects/utilities
-git clone https://github.com/rotemshoshani/utilities ~/projects/utilities
+# Clone the parent repo somewhere, e.g. ~/projects/rsh-utilities
+git clone https://github.com/rotemshoshani/rsh-utilities ~/projects/rsh-utilities
 
 # Symlink council into a directory on your PATH
-ln -sfn ~/projects/utilities/council/council ~/.local/bin/council
+ln -sfn ~/projects/rsh-utilities/council/council ~/.local/bin/council
 # (make sure ~/.local/bin is on $PATH)
 ```
 
